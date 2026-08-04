@@ -11,8 +11,8 @@ from skyrl_gym.envs import register
 @ray.remote(num_cpus=1)
 def skyrl_entrypoint(cfg: SkyRLTrainConfig):
     register(
-        id="ascii_reward",
-        entry_point="examples.train.glm52_0_8b.env:AsciiRewardEnv",
+        id="boolean_reward",
+        entry_point="examples.train.glm52_0_8b.env:BooleanRewardEnv",
     )
     BasePPOExp(cfg).run()
 

@@ -2,7 +2,7 @@
 set -euo pipefail
 set -x
 
-DATA_DIR="${DATA_DIR:-/tmp/skyrl-glm-ascii}"
+DATA_DIR="${DATA_DIR:-/tmp/skyrl-glm-boolean}"
 STEPS="${STEPS:-12}"
 
 export VLLM_MLA_FORCE_DENSE=1
@@ -21,7 +21,7 @@ export TOKENIZERS_PARALLELISM=false
   trainer.policy.model.lora.rank=8 \
   trainer.policy.model.lora.alpha=8 \
   "trainer.policy.model.lora.target_modules=['q_a_proj']" \
-  trainer.policy.optimizer_config.lr=0.0001 \
+  trainer.policy.optimizer_config.lr=0.0005 \
   trainer.policy.use_torch_compile=false \
   trainer.placement.colocate_all=true \
   trainer.strategy=fsdp \
@@ -36,13 +36,15 @@ export TOKENIZERS_PARALLELISM=false
   trainer.policy_mini_batch_size=2 \
   trainer.micro_forward_batch_size_per_gpu=1 \
   trainer.micro_train_batch_size_per_gpu=1 \
-  trainer.eval_before_train=false \
-  trainer.eval_interval=-1 \
+  trainer.eval_before_train=true \
+  trainer.eval_interval=20 \
   trainer.ckpt_interval=-1 \
   trainer.max_prompt_length=64 \
   trainer.flash_attn=false \
   trainer.remove_microbatch_padding=false \
-  generator.sampling_params.max_generate_length=32 \
+  generator.sampling_params.max_generate_length=1 \
+  "generator.sampling_params.additional_kwargs={allowed_token_ids:[15,16]}" \
+  "generator.eval_sampling_params={max_generate_length: 1, temperature: 0.0, additional_kwargs: {allowed_token_ids: [15, 16]}}" \
   generator.inference_engine.backend=vllm \
   generator.inference_engine.run_engines_locally=true \
   generator.inference_engine.weight_sync_backend=nccl \
@@ -50,15 +52,16 @@ export TOKENIZERS_PARALLELISM=false
   generator.inference_engine.enable_prefix_caching=false \
   generator.inference_engine.max_num_batched_tokens=128 \
   generator.inference_engine.max_num_seqs=4 \
+  generator.inference_engine.engine_init_kwargs.enable_chunked_prefill=false \
   generator.inference_engine.engine_init_kwargs.max_model_len=128 \
   generator.batched=true \
   generator.max_input_length=64 \
   generator.max_turns=1 \
-  generator.n_samples_per_prompt=2 \
-  environment.env_class=ascii_reward \
+  generator.n_samples_per_prompt=4 \
+  environment.env_class=boolean_reward \
   trainer.logger=console \
   trainer.print_example_interval=-1 \
-  trainer.log_path=/tmp/skyrl-glm-ascii-qlora-logs \
-  trainer.ckpt_path=/tmp/skyrl-glm-ascii-qlora-ckpt \
+  trainer.log_path=/tmp/skyrl-glm-boolean-qlora-logs \
+  trainer.ckpt_path=/tmp/skyrl-glm-boolean-qlora-ckpt \
   trainer.resume_mode=null \
   "$@"

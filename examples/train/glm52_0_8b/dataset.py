@@ -4,32 +4,39 @@ from pathlib import Path
 from datasets import Dataset
 
 
-PROMPTS = [
-    "Write one short sentence about a bee.",
-    "Write one short sentence about a cloud.",
-    "Write one short sentence about a tree.",
-    "Write one short sentence about a river.",
-]
+TRUTH_TABLES = {
+    "&": ("0", "0", "0", "1"),
+    "|": ("0", "1", "1", "1"),
+    "^": ("0", "1", "1", "0"),
+}
+INPUTS = (("0", "0"), ("0", "1"), ("1", "0"), ("1", "1"))
+
+
+def build_example(operator: str, missing_index: int) -> dict:
+    outputs = TRUTH_TABLES[operator]
+    rows = []
+    for index, ((left, right), output) in enumerate(zip(INPUTS, outputs, strict=True)):
+        suffix = "" if index == missing_index else output
+        rows.append(f"{left}{operator}{right}={suffix}")
+
+    return {
+        "data_source": "glm52_boolean_smoke",
+        "prompt": [{"role": "user", "content": "\n".join(rows)}],
+        "env_class": "boolean_reward",
+        "reward_spec": {"method": "rule", "ground_truth": outputs[missing_index]},
+        "extra_info": {"operator": operator, "missing_index": missing_index},
+    }
 
 
 def build_dataset() -> Dataset:
     return Dataset.from_list(
-        [
-            {
-                "data_source": "glm52_ascii_smoke",
-                "prompt": [{"role": "user", "content": prompt}],
-                "env_class": "ascii_reward",
-                "reward_spec": {"method": "rule"},
-                "extra_info": {"prompt_index": index},
-            }
-            for index, prompt in enumerate(PROMPTS)
-        ]
+        [build_example(operator, missing_index) for operator in TRUTH_TABLES for missing_index in range(len(INPUTS))]
     )
 
 
 def main() -> None:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--output-dir", type=Path, default=Path("/tmp/skyrl-glm-ascii"))
+    parser.add_argument("--output-dir", type=Path, default=Path("/tmp/skyrl-glm-boolean"))
     args = parser.parse_args()
 
     args.output_dir.mkdir(parents=True, exist_ok=True)
