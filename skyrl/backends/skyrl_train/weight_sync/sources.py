@@ -1,8 +1,9 @@
 """``WeightSource`` implementations over SkyRL's training backends.
 
 A ``WeightSource`` is vLLM's trainer-side weight contract
-(``vllm.distributed.weight_transfer.base``): ``metadata()`` and ``__iter__``,
-which must agree element for element. Chunking is vLLM's: the packed producers
+(``vllm.distributed.weight_transfer.base``): ``metadata`` (a
+``functools.cached_property``; vLLM rejects any other kind at class definition)
+and ``iter_full()``, which must agree element for element. Chunking is vLLM's: the packed producers
 cut bounded-memory chunks out of a fixed buffer and consume the source lazily,
 so a source's only obligation is to be a lazy generator that does not retain.
 
@@ -19,8 +20,21 @@ Imports vLLM at module scope, so import this lazily from anything that must work
 without the wheel.
 """
 
+import os
 import re
-from typing import Any, Callable, Dict, Iterable, Iterator, List, Optional, Tuple
+import time
+from functools import cached_property
+from typing import (
+    Any,
+    Callable,
+    Dict,
+    Iterable,
+    Iterator,
+    List,
+    Optional,
+    Sequence,
+    Tuple,
+)
 
 import torch
 from loguru import logger
@@ -47,6 +61,22 @@ _MEGATRON_MTP_RE = re.compile(r"(^|\.)mtp\.")
 _MEGATRON_SHARED_WITH_DRAFT = ("embedding.word_embeddings.weight", "output_layer.weight")
 
 
+def wire_dtype(tensor: torch.Tensor, dtype: torch.dtype) -> torch.dtype:
+    """The dtype a Megatron parameter goes out in: ``dtype``, except fp32, integer and FP8 tensors.
+
+    Parameters a model keeps in fp32 under bf16 training (the MoE router expert bias; Beam's router
+    weight too; DeepSeek-V4's mHC mixing weights and attention sinks) go out in fp32:
+    vLLM keeps them in fp32 too, and a bf16 round trip changes them by ~1/256, enough to move router
+    top-k choices. Integer tables (DeepSeek-V4's hash-routing tid2eid) keep their dtype: bf16 holds
+    integers exactly only up to 256. One-byte floats keep theirs too: an export that re-quantizes to
+    the checkpoint's layout (DeepSeek-V4 / V4.1: FP8 E4M3 weights, e8m0 scales) is already in the
+    dtype vLLM loads, and vLLM's scale loaders reject a widened scale.
+    """
+    if tensor.dtype == torch.float32 or not tensor.is_floating_point() or tensor.element_size() == 1:
+        return tensor.dtype
+    return dtype
+
+
 def is_megatron_mtp_param(name: str) -> bool:
     """Whether a global Megatron parameter name is in the MTP block."""
     return _MEGATRON_MTP_RE.search(name) is not None
@@ -64,7 +94,7 @@ def is_megatron_draft_param(name: str) -> bool:
 class FsdpWeightSource(WeightSource):
     """``WeightSource`` over an FSDP2-sharded HF model.
 
-    ``metadata()`` reads ``state_dict()`` shapes only: an FSDP2 ``DTensor``'s
+    ``metadata`` reads ``state_dict()`` shapes only: an FSDP2 ``DTensor``'s
     ``.shape`` is already the global shape, so declaring the stream costs no
     collective. Iteration all-gathers each parameter (``full_tensor()``), which
     IS a collective, so every trainer rank must iterate the same source in the
@@ -91,11 +121,12 @@ class FsdpWeightSource(WeightSource):
     def weight_prefix(self) -> str:
         return self._prefix
 
+    @cached_property
     def metadata(self) -> List[ParamMeta]:
         sd = self._model.state_dict()
         return [ParamMeta(f"{self._prefix}{key}", self._dtype, tuple(param.shape)) for key, param in sd.items()]
 
-    def __iter__(self) -> Iterator[Tuple[str, torch.Tensor]]:
+    def iter_full(self) -> Iterator[Tuple[str, torch.Tensor]]:
         # The caller selects this rank's CUDA device before iterating; a worker
         # thread does not inherit it (see Worker._weight_sync_thread).
         device = torch.cuda.current_device() if torch.cuda.is_available() else None
@@ -119,8 +150,8 @@ class MegatronWeightSource(WeightSource):
     needs every task sharing a ``group_key`` present in the same call, or the
     expert weights are silently never yielded.
 
-    There is no shape-only export, so ``metadata()`` runs a dry export and
-    caches. Engines call it every round; the cost is one-time.
+    There is no shape-only export, so ``metadata`` runs a dry export once
+    (it is a cached property). Engines read it every round.
 
     ``param_filter`` keeps the conversion tasks whose global Megatron name it
     accepts. Every rank filters the same global list, so they enter the same
@@ -138,7 +169,6 @@ class MegatronWeightSource(WeightSource):
         self._module = module
         self._dtype = dtype
         self._param_filter = param_filter
-        self._meta: Optional[List[ParamMeta]] = None
 
     def _export(self) -> Iterator[Tuple[str, torch.Tensor]]:
         tasks = None
@@ -150,20 +180,23 @@ class MegatronWeightSource(WeightSource):
             ]
         return self._bridge.export_hf_weights(self._module, show_progress=False, conversion_tasks=tasks)
 
-    def metadata(self) -> List[ParamMeta]:
-        if self._meta is None:
-            meta: List[ParamMeta] = []
-            for name, tensor in self._export():
-                meta.append(ParamMeta(name, self._dtype, tuple(tensor.shape)))
-                del tensor
-            self._meta = meta
-        return self._meta
+    def _wire_dtype(self, tensor: torch.Tensor) -> torch.dtype:
+        return wire_dtype(tensor, self._dtype)
 
-    def __iter__(self) -> Iterator[Tuple[str, torch.Tensor]]:
-        # See FsdpWeightSource.__iter__ on the device.
+    @cached_property
+    def metadata(self) -> List[ParamMeta]:
+        meta: List[ParamMeta] = []
+        for name, tensor in self._export():
+            meta.append(ParamMeta(name, self._wire_dtype(tensor), tuple(tensor.shape)))
+            del tensor
+        return meta
+
+    def iter_full(self) -> Iterator[Tuple[str, torch.Tensor]]:
+        # See FsdpWeightSource.iter_full on the device.
         device = torch.cuda.current_device() if torch.cuda.is_available() else None
         for name, tensor in self._export():
-            full = tensor.to(device=device, dtype=self._dtype, non_blocking=True).detach().contiguous()
+            dtype = self._wire_dtype(tensor)
+            full = tensor.to(device=device, dtype=dtype, non_blocking=True).detach().contiguous()
             yield name, full
 
 
@@ -174,7 +207,7 @@ class SerializedFp8WeightSource(WeightSource):
     agnostic to it.
 
     The vLLM trainer engines require metadata and iteration to expose the same
-    expanded stream. The first metadata call therefore runs one dry conversion
+    expanded stream. The first metadata read therefore runs one dry conversion
     and caches the result; subsequent weight syncs stream the wrapped source
     lazily through vLLM's packed buffer.
     """
@@ -182,14 +215,13 @@ class SerializedFp8WeightSource(WeightSource):
     def __init__(self, source: WeightSource, config: Any) -> None:
         self._source = source
         self._config = config
-        self._meta: Optional[List[ParamMeta]] = None
 
     def _serialized(self) -> Iterator[Tuple[str, torch.Tensor]]:
         from skyrl.backends.skyrl_train.weight_sync.fp8 import (
             iter_serialized_fp8_tensors,
         )
 
-        for name, tensor in self._source:
+        for name, tensor in self._source.iter_full():
             for serialized_name, serialized_tensor in iter_serialized_fp8_tensors(
                 name,
                 tensor,
@@ -198,12 +230,101 @@ class SerializedFp8WeightSource(WeightSource):
             ):
                 yield serialized_name, serialized_tensor.detach().contiguous()
 
+    @cached_property
     def metadata(self) -> List[ParamMeta]:
-        if self._meta is None:
-            self._meta = [ParamMeta(name, tensor.dtype, tuple(tensor.shape)) for name, tensor in self._serialized()]
-        return self._meta
+        return [ParamMeta(name, tensor.dtype, tuple(tensor.shape)) for name, tensor in self._serialized()]
 
-    def __iter__(self) -> Iterator[Tuple[str, torch.Tensor]]:
+    def iter_full(self) -> Iterator[Tuple[str, torch.Tensor]]:
+        yield from self._serialized()
+
+
+class SerializedNvfp4WeightSource(WeightSource):
+    """Serialize routed-expert weights into ModelOpt NVFP4 checkpoint tensors (see ``weight_sync/nvfp4.py``).
+
+    ``metadata`` runs ``Nvfp4ExpertSpecSerializer`` over the wrapped source's *metadata*: the same
+    pairing/emission code as iteration, so names, order, dtypes and shapes match, but nothing is
+    quantized or materialized beyond the wrapped source's own metadata. Each pass uses a fresh
+    serializer, so gate/up pairing state never leaks between passes.
+
+    On an NCCL non-sender rank (``set_replay_only``) iteration only replays the wrapped source -- the
+    Megatron export's TP/EP gathers are collectives every rank must join -- and skips quantization: vLLM's
+    NCCL trainer engine discards everything a non-sender yields (``for _ in source.iter_full(): pass``). The sender's
+    stream, i.e. the bytes on the wire, is unchanged.
+    """
+
+    def __init__(
+        self,
+        source: WeightSource,
+        settings: Any,
+        bf16_layers: Sequence[int] = (),
+        stacked_num_experts: Optional[int] = None,
+        min_packed_buffer_bytes: int = 0,
+    ) -> None:
+        self._source = source
+        self._settings = settings
+        # Layers whose routed experts stay BF16 (``num_layers_at_{start,end}_in_bf16``).
+        self._bf16_layers = tuple(bf16_layers)
+        # Set -> ``expert_nvfp4_stacked_sync``: each NVFP4 MoE layer goes out as 8 stacked tensors over this
+        # many experts (``weight_sync/nvfp4_stacked.py``).
+        self._stacked_num_experts = stacked_num_experts
+        # Read by ``build_trainer_engine``: the packed buffer must hold the largest stacked tensor.
+        self.skyrl_min_packed_buffer_bytes = int(min_packed_buffer_bytes)
+        self._replay_only = False
+
+    def set_replay_only(self) -> None:
+        """Mark this rank as one whose iteration output is discarded (NCCL non-sender)."""
+        self._replay_only = True
+
+    def _serializer(self, spec: bool):
+        from skyrl.backends.skyrl_train.weight_sync import nvfp4, nvfp4_stacked
+
+        args = (self._settings, self._bf16_layers)
+        if self._stacked_num_experts is None:
+            return (nvfp4.Nvfp4ExpertSpecSerializer if spec else nvfp4.Nvfp4ExpertSerializer)(*args)
+        cls = nvfp4_stacked.Nvfp4StackedExpertSpecSerializer if spec else nvfp4_stacked.Nvfp4StackedExpertSerializer
+        return cls(*args, num_experts=self._stacked_num_experts)
+
+    def _serialized(self) -> Iterator[Tuple[str, torch.Tensor]]:
+        timing = os.environ.get("SKYRL_NVFP4_SYNC_TIMING", "0") == "1"
+        produce_s, t_last, start = 0.0, time.perf_counter(), time.perf_counter()
+        serializer = self._serializer(spec=False)
+        for name, tensor in self._source.iter_full():
+            for serialized_name, serialized_tensor in serializer(name, tensor):
+                out = serialized_tensor.detach().contiguous()
+                if timing:
+                    produce_s += time.perf_counter() - t_last
+                yield serialized_name, out
+                if timing:
+                    t_last = time.perf_counter()
+        serializer.finish()
+        if timing:
+            produce_s += time.perf_counter() - t_last
+            # Logging only: time spent producing the stream (Megatron export + quantize + stacking) vs. the
+            # wall time of the whole iteration (the rest is the consumer: packing + broadcast + waiting on vLLM).
+            logger.warning(
+                "NVFP4 sync sender: produce %.3fs of %.3fs iteration wall (stacked=%s)",
+                produce_s,
+                time.perf_counter() - start,
+                self._stacked_num_experts is not None,
+            )
+
+    @cached_property
+    def metadata(self) -> List[ParamMeta]:
+        from skyrl.backends.skyrl_train.weight_sync.nvfp4 import TensorSpec
+
+        serializer = self._serializer(spec=True)
+        meta: List[ParamMeta] = []
+        for m in self._source.metadata:
+            for name, spec in serializer(m.name, TensorSpec(m.dtype, tuple(m.shape))):
+                meta.append(ParamMeta(name, spec.dtype, tuple(spec.shape)))
+        serializer.finish()
+        return meta
+
+    def iter_full(self) -> Iterator[Tuple[str, torch.Tensor]]:
+        if self._replay_only:
+            # Not the serialized stream: the caller only drains it to stay in the export collectives.
+            yield from self._source.iter_full()
+            return
         yield from self._serialized()
 
 
@@ -225,11 +346,16 @@ class LoraAdapterWeightSource(WeightSource):
     per-key transform that pairs A with B still has both.
 
     Unlike the model sources, the export cannot be re-run per channel: the
-    dedupe is what decides which keys exist, so ``metadata()`` and iteration
+    dedupe is what decides which keys exist, so ``metadata`` and iteration
     must see one export. :meth:`prepare` runs it once, on every rank, and the
     caller must invoke it before ``send_weights()`` -- the ``receive_target``
     is only known afterwards and has to reach the workers first. Iteration
     drops the cache, so the next round re-exports.
+
+    ``metadata`` is a cached property (vLLM requires it), but this source's
+    metadata changes every round, so :meth:`prepare` and the end of iteration
+    both drop the cached value. Reading it outside a prepared round raises, like
+    iteration (``build_trainer_engine`` keeps vLLM's init-time probe off it).
 
     Retaining the unique adapter between the two channels is what the model
     sources avoid, and is affordable for exactly the same reason the dedupe
@@ -279,6 +405,10 @@ class LoraAdapterWeightSource(WeightSource):
         if missing:
             raise RuntimeError(f"finalize_adapter dropped aliased keys: {sorted(missing)[:5]}")
         self._prepared = (to_send, aliases, adapter_config)
+        self._drop_cached_metadata()
+
+    def _drop_cached_metadata(self) -> None:
+        self.__dict__.pop("metadata", None)
 
     def _prepared_state(self) -> Tuple[Dict[str, torch.Tensor], Dict[str, str], Dict[str, Any]]:
         """The current round's export. Raises rather than exporting implicitly.
@@ -309,13 +439,14 @@ class LoraAdapterWeightSource(WeightSource):
         _, aliases, adapter_config = self._prepared_state()
         return build_lora_receive_target(self._lora_name, adapter_config, aliases)
 
+    @cached_property
     def metadata(self) -> List[ParamMeta]:
         to_send, _, _ = self._prepared_state()
         return [ParamMeta(name, self._dtype, tuple(t.shape)) for name, t in to_send.items()]
 
-    def __iter__(self) -> Iterator[Tuple[str, torch.Tensor]]:
+    def iter_full(self) -> Iterator[Tuple[str, torch.Tensor]]:
         to_send, _, _ = self._prepared_state()
-        # See FsdpWeightSource.__iter__ on the device.
+        # See FsdpWeightSource.iter_full on the device.
         device = torch.cuda.current_device() if torch.cuda.is_available() else None
         try:
             for name, tensor in to_send.items():
@@ -326,6 +457,28 @@ class LoraAdapterWeightSource(WeightSource):
         finally:
             # The next sync re-exports; nothing from this one is worth keeping.
             self._prepared = None
+            self._drop_cached_metadata()
+
+
+def adapter_target_modules(bridge: Any, adapter_weight_names: Iterable[str]) -> List[str]:
+    """``target_modules`` for an exported PEFT adapter, from the model bridge.
+
+    Megatron-Bridge's ``_adapter_target_modules`` hook (what ``AutoBridge.save_hf_adapter`` uses)
+    defaults to PEFT's leaf-name selectors. Bridges whose leaf names are ambiguous override it with
+    full module paths: PEFT matches ``target_modules`` by suffix, so Beam's attention
+    ``self_attn.gate_proj`` would otherwise also wrap every MLP ``mlp.gate_proj``.
+    """
+    names = list(adapter_weight_names)
+    model_bridge = getattr(bridge, "_model_bridge", None)
+    if hasattr(model_bridge, "_adapter_target_modules"):
+        modules = model_bridge._adapter_target_modules(names)
+    else:
+        from megatron.bridge.models.conversion.peft_bridge import (
+            infer_target_modules_from_adapter_weights,
+        )
+
+        modules = infer_target_modules_from_adapter_weights(names)
+    return sorted(set(modules) - {"base_layer"})
 
 
 class MegatronLoraAdapterSource(LoraAdapterWeightSource):
@@ -370,7 +523,6 @@ class MegatronLoraAdapterSource(LoraAdapterWeightSource):
     ) -> Tuple[Dict[str, torch.Tensor], Dict[str, Any]]:
         from megatron.bridge.models.conversion.peft_bridge import (
             build_adapter_config_dict,
-            infer_target_modules_from_adapter_weights,
         )
 
         from skyrl.backends.skyrl_train.distributed.megatron.lora_export import (
@@ -401,7 +553,7 @@ class MegatronLoraAdapterSource(LoraAdapterWeightSource):
         # Fold that scale here and publish lora_alpha == r so vLLM's scale is 1.
         adapter_state = fold_lora_alpha_for_vllm(adapter_state, config_rank=config_rank, alpha=self._lora_cls.alpha)
         adapter_state = _convert_moe_experts_lora_to_vllm(adapter_state)
-        target_modules = sorted(set(infer_target_modules_from_adapter_weights(adapter_state.keys())) - {"base_layer"})
+        target_modules = adapter_target_modules(self._bridge, adapter_state.keys())
         adapter_config = mark_alpha_folded(
             build_adapter_config_dict(
                 self._lora_cls,

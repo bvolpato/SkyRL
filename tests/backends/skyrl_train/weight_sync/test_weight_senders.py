@@ -29,6 +29,7 @@ from skyrl.backends.skyrl_train.weight_sync.control_plane import (  # noqa: E402
 from skyrl.backends.skyrl_train.weight_sync.weight_senders import (  # noqa: E402
     _build_sender_init_info,
     _packed_buffer_size_bytes,
+    mark_replay_only,
     maybe_set_reset_prefix_cache,
     teardown_engine,
 )
@@ -37,17 +38,18 @@ _1GiB = 1024**3
 
 
 class _Source:
-    """Only ``metadata()`` is read here; the engines are not constructed."""
+    """Only ``metadata`` is read here; the engines are not constructed."""
 
     def __init__(self, shapes=((4, 4),), dtype=None):
         self.metadata_calls = 0
         self._meta = [ParamMeta(f"w{i}", dtype or torch.bfloat16, s) for i, s in enumerate(shapes)]
 
+    @property
     def metadata(self):
         self.metadata_calls += 1
         return self._meta
 
-    def __iter__(self):
+    def iter_full(self):
         return iter(())
 
 
@@ -110,6 +112,25 @@ class TestPackedBufferSize:
         """The header gives element counts; the inference dtype turns them into bytes."""
         self._with_max_numel(monkeypatch, 151936 * 4096)
         assert _packed_buffer_size_bytes("m", 0.0, torch.float32) == 151936 * 4096 * 4
+
+
+def test_max_param_numel_skips_tensors_that_are_never_synced(tmp_path):
+    """DeepSeek-V4.1's Engram tables stay in the inference engine; sizing the buffer for one would ask for
+    hundreds of GiB."""
+    from safetensors.torch import save_file
+
+    from skyrl.backends.skyrl_train.weight_sync.checkpoint_shapes import max_param_numel
+
+    save_file(
+        {
+            "layers.1.engram.embed.weight": torch.zeros(64, 8),
+            "layers.1.engram.embed.scale": torch.zeros(64, 1),
+            "layers.1.engram.wkv.weight": torch.zeros(4, 8),
+            "embed.weight": torch.zeros(10, 8),
+        },
+        str(tmp_path / "model.safetensors"),
+    )
+    assert max_param_numel(str(tmp_path)) == 80
 
 
 def test_the_threshold_applies_to_nccl_as_well_as_ipc():
@@ -426,3 +447,85 @@ class TestTeardown:
 
     def test_none_is_a_no_op(self):
         teardown_engine(None)
+
+
+class _ReplayableSource:
+    def __init__(self):
+        self.replay_only = False
+
+    def set_replay_only(self):
+        self.replay_only = True
+
+
+@pytest.mark.parametrize(
+    "backend, is_sender, expected",
+    [
+        ("nccl", False, True),  # vLLM's NCCL engine drains a non-sender's stream and discards it
+        ("nccl", True, False),  # the sender's stream is what goes on the wire
+        ("ipc", False, False),  # every IPC rank ships its own handles
+        ("delta", False, False),
+        ("sharded_rdt", False, False),
+    ],
+)
+def test_mark_replay_only_only_on_nccl_non_senders(backend, is_sender, expected):
+    source = _ReplayableSource()
+    assert mark_replay_only(source, backend=backend, is_sender=is_sender) is expected
+    assert source.replay_only is expected
+
+
+def test_mark_replay_only_ignores_sources_without_the_hook():
+    assert mark_replay_only(object(), backend="nccl", is_sender=False) is False
+
+
+def test_packed_buffer_floor_honours_the_source_minimum():
+    torch_dtype = torch.bfloat16
+    base = _packed_buffer_size_bytes(None, 1.0, torch_dtype)
+    assert _packed_buffer_size_bytes(None, 1.0, torch_dtype, min_bytes=base + 7) == base + 7
+    assert _packed_buffer_size_bytes(None, 1.0, torch_dtype, min_bytes=1) == base
+
+
+@pytest.mark.parametrize("backend", ["nccl", "ipc"])
+def test_trainer_init_does_not_compute_the_source_metadata(monkeypatch, backend):
+    """vLLM 0.33's NCCL/IPC ``trainer_init`` reads ``source.metadata``. For a Megatron source that
+    is a full export, which at init can run against an offloaded model; it must wait for the first
+    send, and must not be cached empty."""
+    from functools import cached_property
+
+    import vllm.distributed.weight_transfer.factory as factory
+
+    import skyrl.backends.skyrl_train.weight_sync as weight_sync
+    from skyrl.backends.skyrl_train.weight_sync import weight_senders
+
+    class Source:
+        exports = 0
+
+        @cached_property
+        def metadata(self):
+            Source.exports += 1
+            return [ParamMeta("w", torch.bfloat16, (2, 2))]
+
+    seen = []
+
+    def fake_trainer_init(init_info, *, client, source):
+        seen.append(list(source.metadata))
+        return SimpleNamespace()
+
+    monkeypatch.setattr(weight_sync, "get_transfer_strategy", lambda *_: backend)
+    monkeypatch.setattr(weight_senders, "_build_sender_init_info", lambda **_: (SimpleNamespace(), None))
+    monkeypatch.setattr(weight_senders, "SkyrlWeightSyncClient", lambda *a, **k: SimpleNamespace())
+    monkeypatch.setattr(factory.WeightTransferTrainerFactory, "trainer_init", staticmethod(fake_trainer_init))
+
+    source = Source()
+    weight_senders.build_trainer_engine(
+        ie_cfg=SimpleNamespace(weight_sync_backend="nccl", model_dtype="bfloat16", speculative_config=None),
+        colocate_all=backend == "ipc",
+        rank=0,
+        inference_world_size=1,
+        source_factory=lambda dtype, backend: source,
+        draft_source_factory=lambda dtype: None,
+        server_urls=["http://x"],
+        data_parallel_size=1,
+        base_model_path=None,
+    )
+    assert seen == [[]] and Source.exports == 0
+    assert [m.name for m in source.metadata] == ["w"] and Source.exports == 1

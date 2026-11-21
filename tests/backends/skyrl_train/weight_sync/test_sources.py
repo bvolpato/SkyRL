@@ -2,7 +2,7 @@
 
 Two properties matter:
 
-* **channel agreement.** ``metadata()`` declares what iteration will yield, and
+* **channel agreement.** ``metadata`` declares what iteration will yield, and
   the trainer engine sizes the worker's receive buffers -- and in packed mode
   cuts its chunk boundaries -- from it. A source that disagrees splits the stream
   differently on each side, which hangs in NCCL rather than erroring.
@@ -35,14 +35,29 @@ def _model():
 
 def _assert_channels_agree(source):
     """The contract vLLM validates at runtime in ``_checked_iter``."""
-    meta = source.metadata()
-    pairs = list(source)
+    meta = source.metadata
+    pairs = list(source.iter_full())
     assert len(meta) == len(pairs)
     for m, (name, tensor) in zip(meta, pairs):
         assert m.name == name
         assert m.dtype == tensor.dtype
         assert m.shape == tuple(tensor.shape)
     return meta, pairs
+
+
+def test_wire_dtype_keeps_fp32_and_integer_parameters():
+    """The rule every Megatron source (push and sharded RDT) applies per tensor."""
+    from skyrl.backends.skyrl_train.weight_sync.sources import wire_dtype
+
+    assert wire_dtype(torch.zeros(2, dtype=torch.bfloat16), torch.bfloat16) == torch.bfloat16
+    assert wire_dtype(torch.zeros(2, dtype=torch.float16), torch.bfloat16) == torch.bfloat16
+    # fp32 router weight / expert bias: a bf16 round trip would move top-k choices.
+    assert wire_dtype(torch.zeros(2, dtype=torch.float32), torch.bfloat16) == torch.float32
+    # Integer tables (hash routing) are exact only in their own dtype.
+    assert wire_dtype(torch.zeros(2, dtype=torch.int64), torch.bfloat16) == torch.int64
+    # FP8 exports (re-quantized checkpoint layout) keep their dtype; wider floats still widen.
+    assert wire_dtype(torch.zeros(2, dtype=torch.float8_e4m3fn), torch.bfloat16) == torch.float8_e4m3fn
+    assert wire_dtype(torch.zeros(2, dtype=torch.bfloat16), torch.float32) == torch.float32
 
 
 class TestFsdpWeightSource:
@@ -53,14 +68,14 @@ class TestFsdpWeightSource:
 
     def test_casts_to_the_inference_dtype(self):
         source = FsdpWeightSource(_model(), torch.bfloat16)
-        # Declared as well as yielded: the worker allocates from metadata().
-        assert {m.dtype for m in source.metadata()} == {torch.bfloat16}
-        assert {t.dtype for _, t in source} == {torch.bfloat16}
+        # Declared as well as yielded: the worker allocates from metadata.
+        assert {m.dtype for m in source.metadata} == {torch.bfloat16}
+        assert {t.dtype for _, t in source.iter_full()} == {torch.bfloat16}
 
     def test_yields_contiguous_tensors(self):
         # NCCL sends `numel` elements straight from data_ptr(), so a
         # non-contiguous view would ship whatever follows its base pointer.
-        assert all(t.is_contiguous() for _, t in FsdpWeightSource(_model(), torch.bfloat16))
+        assert all(t.is_contiguous() for _, t in FsdpWeightSource(_model(), torch.bfloat16).iter_full())
 
     def test_weight_prefix_applies_to_both_channels(self):
         source = FsdpWeightSource(_model(), torch.bfloat16, weight_prefix="language_model.")
@@ -71,7 +86,7 @@ class TestFsdpWeightSource:
 
     def test_is_re_iterable(self):
         source = FsdpWeightSource(_model(), torch.bfloat16)
-        assert [n for n, _ in source] == [n for n, _ in source]
+        assert [n for n, _ in source.iter_full()] == [n for n, _ in source.iter_full()]
 
     def test_metadata_does_not_gather(self, monkeypatch):
         """FSDP2 ``DTensor.shape`` is already the global shape, so declaring the
@@ -83,9 +98,9 @@ class TestFsdpWeightSource:
         monkeypatch.setattr(
             sources_mod,
             "materialize_full_tensor",
-            lambda t: pytest.fail("metadata() must not materialize"),
+            lambda t: pytest.fail("metadata must not materialize"),
         )
-        meta = FsdpWeightSource(_model(), torch.bfloat16).metadata()
+        meta = FsdpWeightSource(_model(), torch.bfloat16).metadata
         assert [m.shape for m in meta] == [(2, 3), (3,)]
 
     def test_iteration_gathers_every_parameter(self, monkeypatch):
@@ -99,7 +114,7 @@ class TestFsdpWeightSource:
             return tensor
 
         monkeypatch.setattr(sources_mod, "materialize_full_tensor", _spy)
-        list(FsdpWeightSource(_model(), torch.bfloat16))
+        list(FsdpWeightSource(_model(), torch.bfloat16).iter_full())
         assert gathered == [(2, 3), (3,)]
 
 
@@ -142,16 +157,16 @@ class TestMegatronWeightSource:
         """`_accumulate_grouped_export` needs every task of a `group_key` in one
         call, or expert weights are silently never yielded."""
         bridge = _FakeBridge(self._tensors())
-        list(MegatronWeightSource(bridge, object(), torch.bfloat16))
+        list(MegatronWeightSource(bridge, object(), torch.bfloat16).iter_full())
         assert bridge.tasks_args == [None]
 
     def test_metadata_caches_its_dry_export(self):
         bridge = _FakeBridge(self._tensors())
         source = MegatronWeightSource(bridge, object(), torch.bfloat16)
-        first = source.metadata()
+        first = source.metadata
         assert bridge.export_calls == 1
-        # Engines call metadata() every round; it must not re-run the export.
-        assert source.metadata() is first
+        # Engines read metadata every round; it must not re-run the export.
+        assert source.metadata is first
         assert bridge.export_calls == 1
 
     def test_iteration_is_lazy(self):
@@ -160,7 +175,7 @@ class TestMegatronWeightSource:
         bounds peak memory."""
         bridge = _FakeBridge(self._tensors())
         source = MegatronWeightSource(bridge, object(), torch.bfloat16)
-        it = iter(source)
+        it = source.iter_full()
         assert bridge.yielded == 0
         next(it)
         assert bridge.yielded == 1
@@ -170,14 +185,165 @@ class TestMegatronWeightSource:
     def test_is_re_iterable_and_re_exports(self):
         bridge = _FakeBridge(self._tensors())
         source = MegatronWeightSource(bridge, object(), torch.bfloat16)
-        assert [n for n, _ in source] == [n for n, _ in source]
+        assert [n for n, _ in source.iter_full()] == [n for n, _ in source.iter_full()]
         assert bridge.export_calls == 2
+
+    def test_keeps_quantized_exports_in_their_dtype(self):
+        """An export re-quantized to the checkpoint's FP8 layout must reach vLLM as FP8 + e8m0 scales,
+        not widened to the bf16 wire dtype (vLLM's scale loader asserts on it)."""
+        e8m0 = getattr(torch, "float8_e8m0fnu", None)
+        if e8m0 is None:
+            pytest.skip("needs torch.float8_e8m0fnu")
+        tensors = [
+            ("layers.0.attn.wkv.weight", torch.ones(4, 4).to(torch.float8_e4m3fn)),
+            ("layers.0.attn.wkv.scale", torch.ones(1, 1).to(e8m0)),
+            ("layers.0.attn_norm.weight", torch.ones(4, dtype=torch.float16)),
+        ]
+        meta, pairs = _assert_channels_agree(MegatronWeightSource(_FakeBridge(tensors), object(), torch.bfloat16))
+        assert [m.dtype for m in meta] == [torch.float8_e4m3fn, e8m0, torch.bfloat16]
+        assert [t.dtype for _, t in pairs] == [m.dtype for m in meta]
 
     def test_reads_the_module_it_was_given(self):
         module = object()
         bridge = _FakeBridge(self._tensors(), expect_module=module)
-        list(MegatronWeightSource(bridge, module, torch.bfloat16))
+        list(MegatronWeightSource(bridge, module, torch.bfloat16).iter_full())
         assert bridge.export_calls == 1
+
+
+class TestSerializedNvfp4WeightSource:
+    """``metadata`` is shape-only and replay-only iteration skips quantization; the sender stream is unchanged."""
+
+    @pytest.fixture(autouse=True)
+    def _fake_quantizer(self, monkeypatch):
+        from skyrl.backends.skyrl_train.weight_sync import nvfp4
+
+        self.calls = []
+
+        def quantize(weight, settings):
+            self.calls.append(weight.shape)
+            rows, cols = weight.shape
+            packed = (weight.float().abs() * 3).to(torch.uint8)[:, : cols // 2].contiguous()
+            scale = torch.ones(rows, cols // 16, dtype=torch.uint8).view(torch.float8_e4m3fn)
+            return packed, scale, weight.float().abs().amax().reshape(())
+
+        monkeypatch.setattr(nvfp4, "quantize_nvfp4_matrix", quantize)
+        from skyrl.backends.skyrl_train.weight_sync import nvfp4_stacked
+
+        monkeypatch.setattr(nvfp4_stacked, "quantize_nvfp4_matrix", quantize)
+        self.settings = nvfp4.Nvfp4WeightQuantSettings("four_over_six")
+
+    @staticmethod
+    def _tensors():
+        def expert(layer, e, proj, rows=4, cols=32):
+            name = f"model.layers.{layer}.mlp.experts.{e}.{proj}.weight"
+            return name, torch.randn(rows, cols).to(torch.bfloat16)
+
+        return [
+            ("model.embed_tokens.weight", torch.ones(4, 16, dtype=torch.bfloat16)),
+            expert(0, 0, "up_proj"),
+            expert(0, 0, "down_proj", rows=32, cols=16),
+            expert(0, 0, "gate_proj"),
+            ("model.layers.0.mlp.gate.weight", torch.ones(2, 32, dtype=torch.bfloat16)),
+            expert(1, 0, "gate_proj"),  # BF16 layer (bf16_layers=[1])
+            expert(1, 0, "up_proj"),
+            ("model.layers.0.mlp.router.e_score_correction_bias", torch.zeros(2, dtype=torch.float32)),
+        ]
+
+    def _source(self, tensors):
+        from skyrl.backends.skyrl_train.weight_sync.sources import (
+            SerializedNvfp4WeightSource,
+        )
+
+        bridge = _FakeBridge(tensors)
+        inner = MegatronWeightSource(bridge, object(), torch.bfloat16)
+        return SerializedNvfp4WeightSource(inner, self.settings, bf16_layers=[1]), bridge
+
+    def test_channels_agree_without_quantizing_for_metadata(self):
+        source, _ = self._source(self._tensors())
+        meta = source.metadata
+        assert self.calls == []  # metadata quantizes nothing
+        _, pairs = _assert_channels_agree(source)
+        assert len(self.calls) == 2  # fused [gate; up] + down_proj of the one NVFP4 expert
+        names = [n for n, _ in pairs]
+        assert names[1:5] == [f"model.layers.0.mlp.experts.0.down_proj.{s}" for s in _NVFP4_SUFFIXES]
+        assert [m.dtype for m in meta[1:5]] == [torch.uint8, torch.float8_e4m3fn, torch.float32, torch.float32]
+        assert "model.layers.1.mlp.experts.0.gate_proj.weight" in names  # tail passes through
+        # fp32 bias keeps fp32 on the wire; the rest go out in bf16.
+        dtypes = dict((m.name, m.dtype) for m in meta)
+        assert dtypes["model.layers.0.mlp.router.e_score_correction_bias"] == torch.float32
+        assert dtypes["model.embed_tokens.weight"] == torch.bfloat16
+
+    def test_replay_only_drains_the_export_and_skips_quantization(self):
+        tensors = self._tensors()
+        sender, _ = self._source(tensors)
+        sender_stream = [(n, t.clone()) for n, t in sender.iter_full()]
+        calls_after_sender = len(self.calls)
+
+        replay, bridge = self._source(tensors)
+        replay.set_replay_only()
+        assert replay.metadata == sender.metadata  # same declaration on every rank
+        exports_before = bridge.export_calls
+        drained = [n for n, _ in replay.iter_full()]
+        assert bridge.export_calls == exports_before + 1 and bridge.yielded > 0  # joined the export collective
+        assert drained == [n for n, _ in tensors]
+        assert len(self.calls) == calls_after_sender  # nothing quantized on the non-sender
+
+        # The sender's stream is unaffected by another rank being replay-only.
+        again = [(n, t) for n, t in sender.iter_full()]
+        assert [n for n, _ in again] == [n for n, _ in sender_stream]
+        for (_, a), (_, b) in zip(again, sender_stream):
+            assert a.dtype == b.dtype and a.shape == b.shape
+            if a.dtype == torch.float8_e4m3fn:
+                a, b = a.view(torch.uint8), b.view(torch.uint8)
+            assert torch.equal(a, b)
+
+    def test_stacked_channels_agree_and_declare_the_buffer_floor(self):
+        from skyrl.backends.skyrl_train.weight_sync.nvfp4_stacked import (
+            NVFP4_STACKED_PREFIX,
+        )
+        from skyrl.backends.skyrl_train.weight_sync.sources import (
+            SerializedNvfp4WeightSource,
+        )
+
+        tensors = self._tensors()
+        inner = MegatronWeightSource(_FakeBridge(tensors), object(), torch.bfloat16)
+        source = SerializedNvfp4WeightSource(
+            inner,
+            self.settings,
+            bf16_layers=[1],
+            stacked_num_experts=1,
+            min_packed_buffer_bytes=1234,
+        )
+        assert source.skyrl_min_packed_buffer_bytes == 1234
+        source.metadata
+        assert self.calls == []
+        _, pairs = _assert_channels_agree(source)
+        names = [n for n, _ in pairs]
+        prefix = f"{NVFP4_STACKED_PREFIX}model.layers.0.mlp.experts."
+        assert [n[len(prefix) :] for n in names if n.startswith(prefix)] == [
+            "w13_weight",
+            "w13_weight_scale",
+            "w13_weight_scale_2",
+            "w13_input_scale",
+            "w2_weight",
+            "w2_weight_scale",
+            "w2_weight_scale_2",
+            "w2_input_scale",
+        ]
+        assert "model.layers.1.mlp.experts.0.gate_proj.weight" in names  # BF16 layer stays per-expert
+
+        replay = SerializedNvfp4WeightSource(
+            MegatronWeightSource(_FakeBridge(tensors), object(), torch.bfloat16),
+            self.settings,
+            bf16_layers=[1],
+            stacked_num_experts=1,
+        )
+        replay.set_replay_only()
+        calls = len(self.calls)
+        assert [n for n, _ in replay.iter_full()] == [n for n, _ in tensors] and len(self.calls) == calls
+
+
+_NVFP4_SUFFIXES = ("weight", "weight_scale", "weight_scale_2", "input_scale")
 
 
 def _expert_key(expert: int, which: str) -> str:
@@ -233,8 +399,8 @@ class TestLoraAdapterWeightSource:
         source = self._source()
         source.prepare()
         assert source.receive_target["lora_name"] == "tenant"
-        names = [m.name for m in source.metadata()]
-        sent = [n for n, _ in source]
+        names = [m.name for m in source.metadata]
+        sent = [n for n, _ in source.iter_full()]
         assert source.exports == 1
         assert names == sent
         # finalize only ever sees the canonical keys.
@@ -245,7 +411,7 @@ class TestLoraAdapterWeightSource:
         source = self._source(state=state)
         source.prepare()
         target = source.receive_target
-        sent = {m.name for m in source.metadata()}
+        sent = {m.name for m in source.metadata}
         # 2 groups of 2 experts -> 2 expert tensors sent, 2 aliased, plus 1 dense.
         assert len(sent) == 3
         assert set(target["aliases"]) | sent == set(state)
@@ -254,13 +420,13 @@ class TestLoraAdapterWeightSource:
     def test_casts_to_the_wire_dtype_on_both_channels(self):
         source = self._source()
         source.prepare()
-        assert {m.dtype for m in source.metadata()} == {torch.bfloat16}
-        assert {t.dtype for _, t in source} == {torch.bfloat16}
+        assert {m.dtype for m in source.metadata} == {torch.bfloat16}
+        assert {t.dtype for _, t in source.iter_full()} == {torch.bfloat16}
 
     def test_yields_contiguous_tensors(self):
         source = self._source()
         source.prepare()
-        assert all(t.is_contiguous() for _, t in source)
+        assert all(t.is_contiguous() for _, t in source.iter_full())
 
     def test_the_target_carries_the_name_and_adapter_config(self):
         source = self._source(adapter_config={"r": 4, "lora_alpha": 8})
@@ -273,7 +439,7 @@ class TestLoraAdapterWeightSource:
     def test_consuming_the_stream_re_exports_next_round(self):
         source = self._source()
         source.prepare()
-        list(source)
+        list(source.iter_full())
         assert source.exports == 1
         source.set_lora_name("next")
         source.prepare()
@@ -286,19 +452,31 @@ class TestLoraAdapterWeightSource:
         for the full NCCL watchdog timeout instead of failing."""
         source = self._source()
         with pytest.raises(RuntimeError, match="no prepared adapter"):
-            source.metadata()
+            source.metadata
         with pytest.raises(RuntimeError, match="no prepared adapter"):
-            list(source)
+            list(source.iter_full())
         assert source.exports == 0
 
-    def test_reading_after_the_stream_is_consumed_raises(self):
-        """The trap the trainer fell into: the round is over, the cache is gone,
-        and a stray metadata() would re-export on one rank only."""
+    def test_each_round_declares_its_own_adapter(self):
+        """``metadata`` is a cached property; the next round's prepare() must drop the
+        value cached in this one, or it would declare the previous adapter."""
         source = self._source()
         source.prepare()
-        list(source)
+        first = [m.name for m in source.metadata]
+        assert first == [n for n, _ in source.iter_full()]
+        source.prepare()
+        assert [m.name for m in source.metadata] == first and source.exports == 2
+
+    def test_reading_after_the_stream_is_consumed_never_re_exports(self):
+        """The trap the trainer fell into: the round is over, the cache is gone,
+        and a stray metadata read would re-export on one rank only."""
+        source = self._source()
+        source.prepare()
+        list(source.iter_full())
         with pytest.raises(RuntimeError, match="no prepared adapter"):
-            source.metadata()
+            source.metadata
+        with pytest.raises(RuntimeError, match="no prepared adapter"):
+            list(source.iter_full())
         assert source.exports == 1
 
     def test_prepare_is_idempotent_within_a_round(self):
@@ -321,3 +499,30 @@ class TestLoraAdapterWeightSource:
         source.set_lora_name("tenant")
         with pytest.raises(RuntimeError, match="dropped aliased keys"):
             source.prepare()
+
+
+def test_adapter_target_modules_uses_the_bridge_hook():
+    """The model bridge's ``_adapter_target_modules`` decides the PEFT ``target_modules`` (Beam returns
+    full paths, since its attention ``self_attn.gate_proj`` and MLP ``mlp.gate_proj`` share a leaf
+    name); ``base_layer`` is dropped and the result is sorted and deduplicated."""
+    calls = []
+
+    class _ModelBridge:
+        def _adapter_target_modules(self, names):
+            calls.append(names)
+            return ["model.layers.0.self_attn.gate_proj", "base_layer", "model.layers.0.mlp.down_proj"] * 2
+
+    class _AutoBridge:
+        _model_bridge = _ModelBridge()
+
+    names = (f"base_model.model.model.layers.0.self_attn.gate_proj.lora_{ab}.weight" for ab in "AB")
+    assert sources_mod.adapter_target_modules(_AutoBridge(), names) == [
+        "model.layers.0.mlp.down_proj",
+        "model.layers.0.self_attn.gate_proj",
+    ]
+    assert calls == [
+        [
+            "base_model.model.model.layers.0.self_attn.gate_proj.lora_A.weight",
+            "base_model.model.model.layers.0.self_attn.gate_proj.lora_B.weight",
+        ]
+    ]

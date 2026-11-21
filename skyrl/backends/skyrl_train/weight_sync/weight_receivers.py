@@ -6,8 +6,9 @@ callback, so the only injection point is the ``self.model`` handle they read.
 That handle is whichever model the session targets -- the main model, or the
 spec-decode drafter under ``/start_draft_weight_update``.
 
-* **Checkpoint loading.** Split compact batched-MoE FP8 wire tensors from
-  ordinary checkpoint weights before calling the target model's loader.
+* **Checkpoint loading.** Split compact batched-MoE FP8 wire tensors and stacked
+  NVFP4 expert layers from ordinary checkpoint weights before calling the target
+  model's loader.
 * **LoRA staging.** When the round has been armed with a LoRA receive target
   (``weight_sync/lora_target.py``), the stream is a PEFT adapter rather than the
   model: the tensors are staged for vLLM's LoRA manager instead of loaded, and
@@ -71,11 +72,24 @@ class SkyrlCheckpointLoadMixin:
         from skyrl.backends.skyrl_train.inference_servers.new_inference_worker_wrap import (
             _load_checkpoint_weights,
         )
+        from skyrl.backends.skyrl_train.weight_sync.nvfp4_stacked_receive import (
+            Nvfp4StackedReceiver,
+        )
 
         model = self.model
+        # Stacked NVFP4 expert layers (``expert_nvfp4_stacked_sync``) may span receive batches and, under
+        # vLLM 0.33's packed IPC, separate ``receive_weights`` calls (one per packed chunk). So the receiver
+        # lives for the whole update round: it holds a partial layer until it is complete, and
+        # ``finish_weight_update`` checks that nothing is left over. Its fallback is the per-expert path.
+        stacked = getattr(self, "_skyrl_nvfp4_stacked", None)
+        if stacked is None or stacked.model is not model:
+            if stacked is not None:
+                stacked.finish()
+            stacked = Nvfp4StackedReceiver(model, fallback_load=lambda w: model.load_weights(weights=w))
+            self._skyrl_nvfp4_stacked = stacked
 
         def load_weights(weights: Any, **kwargs: Any) -> Any:
-            return _load_checkpoint_weights(model, weights, **kwargs)
+            return _load_checkpoint_weights(model, weights, nvfp4_stacked_receiver=stacked, **kwargs)
 
         # The proxy scopes the override to the `WeightTransferEngine` context
         # instead of mutating `load_weights` on the model object itself.
@@ -260,25 +274,58 @@ class SkyrlReceiveLifecycleMixin(SkyrlLoraStagingMixin, SkyrlCheckpointLoadMixin
             self.skyrl_begin_lora_update()
             return
         skyrl_before_weight_update()
+        # A round that failed part-way must not leak its partial stacked NVFP4 layers into this one.
+        self._skyrl_nvfp4_stacked = None
         with torch.device(self.device):
             super().start_weight_update()
 
     def receive_weights(self, update_info: Any) -> None:
-        if self.skyrl_lora_armed():
-            with torch.device(self.device), self.skyrl_lora_staging():
+        try:
+            if self.skyrl_lora_armed():
+                with torch.device(self.device), self.skyrl_lora_staging():
+                    super().receive_weights(update_info)
+                return
+            with torch.device(self.device), self.skyrl_checkpoint_load():
                 super().receive_weights(update_info)
-            return
-        with torch.device(self.device), self.skyrl_checkpoint_load():
-            super().receive_weights(update_info)
+        finally:
+            # vLLM's NCCL receiver caches each round's update info keyed by `self.model`, which here
+            # is a per-round proxy whose `load_weights` closure holds the round's staged tensors (a
+            # LoRA round's adapter copy on the GPU). SkyRL's trainer always ships the names, so the
+            # cache is never read: drop it so no proxy, or what it holds, outlives its round.
+            last = getattr(self, "_last_update_info", None)
+            if last is not None:
+                last.clear()
+
+    def skyrl_release_receive_buffers(self) -> None:
+        """Release receive buffers the vLLM engine holds until the end of a round.
+
+        vLLM's ``finish_weight_update`` releases them after its layerwise
+        finalize. For an adapter round, ``finish_weight_update`` calls this hook
+        in place of vLLM's. No-op for transports whose receive buffers do not
+        outlive ``receive_weights``.
+        """
 
     def finish_weight_update(self) -> None:
         if self.skyrl_lora_armed():
             # No layerwise finalize: an adapter update never writes to the base
             # model's parameters.
-            self.skyrl_finish_lora_update()
+            try:
+                self.skyrl_finish_lora_update()
+            finally:
+                self.skyrl_release_receive_buffers()
             return
+        from skyrl.backends.skyrl_train.patches.vllm.patch_moe_kernel_constants import (
+            restore_moe_kernel_constants,
+        )
+
+        stacked = getattr(self, "_skyrl_nvfp4_stacked", None)
+        self._skyrl_nvfp4_stacked = None
+        if stacked is not None:
+            stacked.finish()  # raises on a stacked layer that never completed
         with torch.device(self.device):
             super().finish_weight_update()
+            # A level-2 sleep zeroes MoE kernel constants that no reload rebuilds.
+            restore_moe_kernel_constants(self.model)
         skyrl_after_weight_update()
         empty_cuda_cache_rocm()
 
@@ -297,6 +344,12 @@ def _build_skyrl_ipc_engine() -> type:
 
     class SkyrlIPCWeightTransferEngine(SkyrlReceiveLifecycleMixin, IPCWeightTransferEngine):
         """vLLM's CUDA IPC receive engine plus SkyRL receive targets."""
+
+        def skyrl_release_receive_buffers(self) -> None:
+            # The importer holds this worker's mapping of the trainer's packed
+            # IPC buffer. Closing it once per export releases the producer-side
+            # refcount, so the trainer's ``ipc_collect`` can free the buffer.
+            self._packed_importer.close()
 
     return SkyrlIPCWeightTransferEngine
 

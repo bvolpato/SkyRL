@@ -11,10 +11,28 @@ SkyRL uses Megatron-Bridge for HF-to-Megatron model conversion. Installed from g
 - GLM-5.3-Flash (`glm5_next`): `skyrl/backends/skyrl_train/patches/megatron/glm5_next/` (provider, block
   spec, bridge; Megatron-Bridge-shaped) on top of `skyrl/backends/skyrl_train/patches/megatron/mcore_ext/`
   (Megatron-Core-shaped: `hyper_connection.py` backport of Megatron-LM main's mHC module,
-  `mhc_transformer_layer.py` mHC layer with MoE support, `kda.py` KDA linear attention, `dsa_kpool.py` k-pool
-  DSA indexer kernels). The DSA layers are megatron-core's `DSAttention` (NoPE MLA) with the k-pool top-k
-  swapped in by `glm5_next/dsa.py`. Removal plan when bumping megatron: `patches/megatron/README.md`. Requires
+  `mhc_transformer_layer.py` mHC layer with MoE support, `kda.py` KDA linear attention). The DSA layers are
+  megatron-core's `DSAttention` (NoPE MLA, k-pool indexer); `glm5_next/dsa.py` adds a long-sequence guard and
+  the opt-in `SKYRL_DSA_INDEXER_TP_SHARD`. Removal plan when bumping megatron: `patches/megatron/README.md`. Requires
   `language_model_only=True` (VL checkpoint) and packed sequences (`remove_microbatch_padding=True`).
+- Beam (`beam`): upstream Megatron-Bridge `BeamBridge` (`HybridModel`, attention + MLP hybrid layer per decoder
+  layer) and vLLM 0.33's `BeamForCausalLM`, served with LoRA through `patches/vllm/patch_beam_lora.py` (a
+  `vllm.general_plugins` entry point registering a `SupportsLoRA` subclass). SkyRL also carries the transformers
+  config (`patches/transformers/configuration_beam.py`), the CP comm-type default, the fused LM-head softcap and the
+  FP8 spec (`weight_sync/fp8/models/beam.py`); see `patches/megatron/README.md`. Tiny-model GPU rows: `beam-tiny_*` in
+  `gpu_ci/megatron/test_megatron_{,lora_}models.py` (`megatron_tiny_models/create_beam_tiny.py`).
+
+## Optimizer state on disk
+
+`megatron_config.optimizer_offload_to_disk` (`skyrl/backends/skyrl_train/distributed/megatron/optimizer_offload_to_disk.py`):
+`OffloadedDistributedOptimizer` subclasses megatron-core's `DistributedOptimizer`, keeps fp32 mains + Adam moments
+for each rank's contiguous DDP-bucket shards in one file per rank and optimizer, and streams them through the GPU in
+chunks during `step_with_ready_grads`. Its `_build_model_and_main_param_groups` is generated from the installed
+megatron-core source by replacing one line (`shard_main_param = shard_model_param.clone().float()`); a megatron-core
+bump that moves that line fails `tests/backends/skyrl_train/distributed/test_optimizer_offload_to_disk.py` (run with
+`--extra megatron`) and the GPU test. Correctness test (bit-identity vs the regular optimizer, 2 GPUs):
+`tests/backends/skyrl_train/gpu/gpu_ci/test_optimizer_offload_to_disk.py`. See also
+`skyrl/backends/skyrl_train/patches/megatron/README.md`.
 
 ## Parallelism Strategies
 
@@ -34,3 +52,42 @@ Note: Sequence parallelism is auto-enabled when `tensor_model_parallel_size > 1`
 ## Test Requirements
 
 Megatron GPU tests need: `NVTE_FLASH_ATTN=0`
+
+## NVFP4 quantization-aware training (`workers/megatron/quantization/`)
+
+- `expert_nvfp4.py` (`megatron_config.expert_nvfp4`): rounds the routed-expert weights, and with `w4a4` the
+  per-token expert inputs, to the rollouts' NVFP4 grid. The weight sync side is in `weight_sync.md`
+  ("Serialized NVFP4 expert sync"). The round trips and packs run on the fused sm_100 kernels
+  (`kernels/nvfp4_quant/fused_rt.py`, `csrc/nvfp4_roundtrip.cu`), which `nvcc` builds on first use into
+  `SKYRL_QAT_NVFP4_KERNEL_DIR` (default `$TMPDIR/skyrl_nvfp4_kernels_<uid>`; the user's own, not writable by
+  others). Without `nvcc`, after a failed build, or with `SKYRL_QAT_NVFP4_FUSED=0`, they run on FlashInfer and
+  the Triton decode (`kernels/nvfp4_quant/decode.py`) with the same round-to-nearest bytes
+  (`tests/backends/skyrl_train/gpu/gpu_ci/test_nvfp4_fused_roundtrip.py`). The startup line
+  `expert_nvfp4 (<mode>): ...` names the path in use.
+- `fake_kv_cache_qat.py` (`megatron_config.kv_cache_qat`, DSA models only): replaces each absorbed-MLA key with
+  the dequantized row of vLLM's `nvfp4_ds_mla` / `fp8_ds_mla` KV cache (`kernels/kv_cache_round_trip.py`, Triton).
+  `_apply_kv_cache_qat_cfg` (`skyrl/train/utils/utils.py`) copies the format from the engines' `kv_cache_dtype`,
+  requires `attention_config.sparse_mla_force_mqa=true` and rejects `enable_pd`. Tests:
+  `tests/backends/skyrl_train/workers/megatron/quantization/test_fake_kv_cache_qat.py` (CPU) and
+  `tests/backends/skyrl_train/gpu/gpu_ci/test_kv_cache_round_trip.py` (GPU, bit-exact against vLLM's cache writer
+  and reader).
+- User docs for both: `docs/content/docs/examples/quantized_rollouts.mdx`.
+
+## LoRA adapter import (`lora.init_adapter_path`)
+
+- `skyrl/backends/skyrl_train/distributed/lora_import.py` (CPU, no megatron imports): parses a PEFT adapter
+  into per-module pieces with their PEFT scale (`rank_pattern` / `alpha_pattern` / rslora), folds Tinker's
+  `linear_attn.in_proj_q/k/v` into `in_proj_qkv`, stacks pieces block-diagonally, and folds per-module
+  scales for vLLM's uniform `lora_alpha / r`.
+- `skyrl/backends/skyrl_train/distributed/megatron/lora_import.py`: `SkyRLLoRA` (Megatron-Bridge `LoRA`
+  with per-module `module_dims`), `plan_megatron_lora_import` (adapter module -> Megatron module via the
+  bridge mapping registry, fused rank = sum of constituent ranks padded to TP), and
+  `load_peft_adapter_into_megatron` (places tensors through the bridge's adapter conversion tasks; the
+  fused `lora_B` row layout comes from running `_get_fused_adapter_linear_out_slices` on an index tensor).
+- `distributed/megatron/lora_output_layer.py`: `enable_output_layer_attr_passthrough`, applied in the LoRA
+  pre-wrap hook so a LoRA-wrapped `output_layer` answers `GPTModel._postprocess`'s reads/writes of
+  `gather_output` / `sequence_parallel` with its base linear's attributes.
+- Hooked in `MegatronWorker.configure_lora` (plan, targets, dims) and `make_megatron_module` (load after
+  `provide_distributed_model`). MoE expert adapters and `canonical_lora` raise `NotImplementedError`.
+- Test: `tests/backends/skyrl_train/gpu/gpu_ci/megatron/test_lora_init_adapter.py` (HF+peft reference on
+  a tiny Qwen3.6-style GDN model built by `megatron_tiny_models/create_qwen36_dense_tiny.py`).
