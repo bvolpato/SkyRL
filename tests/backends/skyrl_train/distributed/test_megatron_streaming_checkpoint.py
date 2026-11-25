@@ -220,7 +220,9 @@ def test_optim_step_waits_before_grad_sync(save_strategy, write_gate, tmp_path):
     tensors = {"router.expert_bias": torch.zeros(4)}
     expected = {name: tensor.clone() for name, tensor in tensors.items()}
     worker = MegatronPolicyWorkerBase.__new__(MegatronPolicyWorkerBase)
-    worker.cfg = SimpleNamespace(log_mfu=False)
+    worker.cfg = SimpleNamespace(
+        log_mfu=False, policy=SimpleNamespace(megatron_config=SimpleNamespace(expert_nvfp4=False))
+    )
     worker.strategy = save_strategy
     worker.optimizer = _Optimizer({})
     worker.scheduler = Mock()

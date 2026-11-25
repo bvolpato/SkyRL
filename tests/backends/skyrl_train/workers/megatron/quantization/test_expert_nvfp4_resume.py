@@ -36,6 +36,9 @@ class _Strategy:
     def __init__(self, saved_scheduler: dict | None = None):
         self.saved_scheduler = saved_scheduler
 
+    def finish_streaming_save(self):
+        pass
+
     def optimizer_step(self, optimizer, model, scheduler, name):
         scheduler.step(1)
         return None
