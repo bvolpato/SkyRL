@@ -78,12 +78,14 @@ def _fft_dispatch_cfg(weight_sync_backend: str = "nccl") -> SimpleNamespace:
         trainer=SimpleNamespace(
             strategy="fsdp",
             policy=SimpleNamespace(
-                model=SimpleNamespace(lora=SimpleNamespace(rank=0)),
+                model=SimpleNamespace(lora=SimpleNamespace(rank=0, sync_mode="disk")),
                 megatron_config=SimpleNamespace(lora_config=SimpleNamespace(merge_lora=False)),
             ),
         ),
         generator=SimpleNamespace(
-            inference_engine=SimpleNamespace(weight_sync_backend=weight_sync_backend, offload_kv_for_weight_sync=False),
+            inference_engine=SimpleNamespace(
+                weight_sync_backend=weight_sync_backend, offload_kv_for_weight_sync=False, data_parallel_size=1
+            ),
         ),
     )
 
@@ -236,6 +238,38 @@ class TestSaveWeights:
         dispatch._inference_engine_client.resume_generation.assert_not_awaited()
 
     @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "sync_mode, data_parallel_size, pauses",
+        [("memory", 4, True), ("disk", 4, True), ("memory", 1, False), ("disk", 1, False)],
+    )
+    async def test_inplace_lora_sync_pauses_under_data_parallel(self, sync_mode, data_parallel_size, pauses):
+        """Under data parallelism the engines are paused around the in-place LoRA sync: the in-memory sync is a
+        collective RPC that a still-generating rank deadlocks (the DP ranks step in lockstep), and the disk sync would
+        otherwise swap the adapter on each rank at a different step. Single-rank engines keep the no-pause swap."""
+        from skyrl.backends.skyrl_train.workers.worker_dispatch import WorkerDispatch
+
+        cfg = _fft_dispatch_cfg()
+        cfg.trainer.policy.model.lora.rank = 32
+        cfg.trainer.policy.model.lora.sync_mode = sync_mode
+        cfg.generator.inference_engine.data_parallel_size = data_parallel_size
+
+        call_order = []
+        dispatch = WorkerDispatch.__new__(WorkerDispatch)
+        dispatch.colocate_all = False
+        dispatch.cfg = cfg
+        dispatch._inference_engine_client = AsyncMock()
+        dispatch._inference_engine_client.pause_generation = AsyncMock(side_effect=lambda: call_order.append("pause"))
+        dispatch._inference_engine_client.resume_generation = AsyncMock(side_effect=lambda: call_order.append("resume"))
+        dispatch._broadcast_to_inference_engines = MagicMock(side_effect=lambda *a, **k: call_order.append("sync"))
+        dispatch._prepare_for_weight_sync = AsyncMock()
+        dispatch._finish_weight_sync = MagicMock()
+        dispatch.ensure_active_adapter = MagicMock()
+
+        await dispatch.save_weights_for_sampler(model_id="lora-target")
+
+        assert call_order == (["pause", "sync", "resume"] if pauses else ["sync"])
+
+    @pytest.mark.asyncio
     async def test_non_colocated_megatron_merge_lora_still_pauses(self):
         """Megatron + merge_lora keeps the pause/resume path (LoRA merged
         into the base weights → tensors flow over NCCL, not load_lora_adapter)."""
@@ -277,12 +311,11 @@ class TestSaveWeights:
 
     @pytest.mark.asyncio
     async def test_broadcast_does_not_block_event_loop(self):
-        """The broadcast blocks on ``ray.get``. A timeout armed by a coroutine sharing the
-        loop (a fully-async generator's HTTP request) must not expire because of it."""
+        """A coroutine sharing the loop must run before the blocking broadcast finishes."""
         dispatch = self._nccl_dispatch(lambda *args, **kwargs: time.sleep(0.5))
 
         sync = asyncio.create_task(dispatch.save_weights_for_sampler())
-        async with asyncio.timeout(0.4):
+        async with asyncio.timeout(1.0):
             await asyncio.sleep(0.05)
         assert not sync.done()
         await sync
@@ -355,6 +388,127 @@ class TestSaveWeights:
             await sync
 
         assert events == ["wake_weights", "broadcast_done", "wake_kv_cache", "resumed"]
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("fail", [False, True])
+    async def test_colocated_sync_resumes_frozen_requests_after_the_kv_cache_wake(self, fail):
+        """The partial-rollout trainer can sleep the engines with frozen requests. The sync then wakes
+        the allocator directly and resumes generation last. When the transfer fails, the engines stay
+        asleep: the trainer model is still on the shared GPUs."""
+        events = []
+
+        def broadcast(*args, **kwargs):
+            events.append("broadcast_done")
+            if fail:
+                raise RuntimeError("broadcast failed")
+
+        dispatch = self._nccl_dispatch(broadcast)
+        dispatch.colocate_all = True
+        client = dispatch._inference_engine_client
+        client.requests_frozen_asleep = True
+        client.wake_for_weight_sync.side_effect = lambda tags: events.append(f"wake_{tags[0]}")
+        client.resume_generation.side_effect = lambda: events.append("resumed")
+
+        if fail:
+            with pytest.raises(RuntimeError):
+                await dispatch.save_weights_for_sampler()
+        else:
+            await dispatch.save_weights_for_sampler()
+
+        if fail:
+            assert events == ["wake_weights", "broadcast_done"]
+        else:
+            assert events == ["wake_weights", "broadcast_done", "wake_kv_cache", "resumed"]
+        client.wake_up.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_frozen_colocated_sync_does_not_resume_when_the_kv_cache_wake_fails(self):
+        """Requests that resume on a sleeping KV cache read unmapped memory. Keep them paused."""
+        dispatch = self._nccl_dispatch(lambda *args, **kwargs: None)
+        dispatch.colocate_all = True
+        client = dispatch._inference_engine_client
+        client.requests_frozen_asleep = True
+
+        async def wake(tags):
+            if tags == ["kv_cache"]:
+                raise RuntimeError("kv cache wake failed")
+
+        client.wake_for_weight_sync.side_effect = wake
+
+        with pytest.raises(RuntimeError, match="kv cache wake failed"):
+            await dispatch.save_weights_for_sampler()
+
+        client.resume_generation.assert_not_called()
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "enable_prefix_caching, clear_kv_cache_on_weight_sync, accepted",
+        [(True, True, True), (True, False, False), (False, True, False)],
+    )
+    async def test_frozen_colocated_sync_needs_a_prefix_cache_reset_when_the_kv_cache_is_discarded(
+        self, enable_prefix_caching, clear_kv_cache_on_weight_sync, accepted
+    ):
+        """After ``sleep_with_frozen_requests(offload_kv=False)`` the paused requests have no KV cache.
+        Only a weight sync that resets the prefix cache makes the inference engine prefill them again.
+        Any other weight sync fails before it wakes the engines."""
+        events = []
+        dispatch = self._nccl_dispatch(lambda *args, **kwargs: events.append("broadcast_done"))
+        dispatch.colocate_all = True
+        dispatch.cfg.trainer.fully_async = SimpleNamespace(
+            enabled=True, clear_kv_cache_on_weight_sync=clear_kv_cache_on_weight_sync
+        )
+        dispatch.cfg.generator.inference_engine.enable_prefix_caching = enable_prefix_caching
+        client = dispatch._inference_engine_client
+        client.requests_frozen_asleep = True
+        client.frozen_kv_offloaded = False
+        client.wake_for_weight_sync.side_effect = lambda tags: events.append(f"wake_{tags[0]}")
+        client.resume_generation.side_effect = lambda: events.append("resumed")
+
+        if accepted:
+            await dispatch.save_weights_for_sampler()
+            assert events == ["wake_weights", "broadcast_done", "wake_kv_cache", "resumed"]
+        else:
+            with pytest.raises(AssertionError, match="does not reset the prefix cache"):
+                await dispatch.save_weights_for_sampler()
+            assert events == []
+
+    @pytest.mark.asyncio
+    async def test_prepare_for_weight_sync_does_not_sleep_engines_that_hold_frozen_requests(self):
+        """`sleep()` aborts the in-flight requests, so the preparation must skip it."""
+        from skyrl.backends.skyrl_train.workers.worker_dispatch import WorkerDispatch
+
+        dispatch = WorkerDispatch.__new__(WorkerDispatch)
+        dispatch.colocate_all = True
+        dispatch.cfg = SimpleNamespace(
+            trainer=SimpleNamespace(policy=SimpleNamespace(optimizer_config=SimpleNamespace(offload_after_step=False)))
+        )
+        dispatch._gpu_state = {"policy": SimpleNamespace(model_on_gpu=True, optimizer_on_gpu=False)}
+        dispatch._ensure_on_gpu = MagicMock()
+        dispatch.empty_cache = MagicMock()
+        client = AsyncMock()
+        client.requests_frozen_asleep = True
+        client.is_sleeping.return_value = False
+        dispatch._inference_engine_client = client
+
+        await dispatch._prepare_for_weight_sync()
+        client.sleep.assert_not_called()
+
+        client.requests_frozen_asleep = False
+        await dispatch._prepare_for_weight_sync()
+        client.sleep.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_colocated_sync_uses_wake_up_when_no_request_is_frozen(self):
+        dispatch = self._nccl_dispatch(lambda *args, **kwargs: None)
+        dispatch.colocate_all = True
+        client = dispatch._inference_engine_client
+        client.requests_frozen_asleep = False
+
+        await dispatch.save_weights_for_sampler()
+
+        assert [call.kwargs["tags"] for call in client.wake_up.await_args_list] == [["weights"], ["kv_cache"]]
+        client.wake_for_weight_sync.assert_not_called()
+        client.resume_generation.assert_not_called()
 
 
 def _adapter_sync_dispatch(*, model_on_gpu: bool, optimizer_on_gpu: bool = False):

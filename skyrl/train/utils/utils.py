@@ -6,10 +6,11 @@ import os
 import socket
 import sys
 import time
+from contextlib import contextmanager
 from copy import deepcopy
 from datetime import datetime
 from pathlib import Path
-from typing import Optional
+from typing import Any, Callable, Optional
 
 import ray
 import torch
@@ -18,6 +19,7 @@ from ray.util.placement_group import (
     PlacementGroup,
     placement_group,
     placement_group_table,
+    remove_placement_group,
 )
 from ray.util.scheduling_strategies import PlacementGroupSchedulingStrategy
 
@@ -28,6 +30,10 @@ from skyrl.backends.skyrl_train.distributed.megatron.quantization_utils import (
     resolve_auto_fp8_recipe,
     resolve_auto_wire_format,
     validate_concrete_fp8_recipe,
+)
+from skyrl.backends.skyrl_train.kernels.nvfp4_quant import (
+    BLOCK_SCALE_FOUR_OVER_SIX,
+    flashinfer_nvfp4_env,
 )
 from skyrl.backends.skyrl_train.utils.io.io import is_cloud_path
 from skyrl.backends.skyrl_train.weight_sync.fp8 import (
@@ -44,10 +50,12 @@ from skyrl.env_vars import (
 )
 from skyrl.train.config.config import (
     SUPPORTED_SPECULATIVE_DECODING_METHODS,
+    MegatronConfig,
     SkyRLTrainConfig,
     get_config_as_dict,
 )
 from skyrl.train.utils import deadline
+from skyrl.utils.tok import check_is_vlm
 
 
 class Timer:
@@ -84,6 +92,23 @@ class Timer:
             self.update_dict[self.message] = self.update_dict.get(self.message, 0.0) + time.time() - self.start_time
 
 
+def _megatron_dp_size(role: str, world_size: int, megatron_config: MegatronConfig) -> int:
+    """The data parallel size of a Megatron model (``role``: policy or ref) on ``world_size`` GPUs.
+
+    Megatron lays the GPUs out twice: a dense grid (tp * cp * pp) and an expert grid (etp * ep * pp), and
+    builds the expert grid even for a dense model. Both must divide the world size (see MegatronConfig).
+    """
+    pp = megatron_config.pipeline_model_parallel_size
+    cp = megatron_config.context_parallel_size
+    tp = megatron_config.tensor_model_parallel_size
+    assert world_size % (pp * cp * tp) == 0, (
+        f"{role}_world_size {world_size} should be divisible by (pp * cp * tp) {pp * cp * tp}. "
+        "This ensures that the data parallel size is an integer."
+    )
+    megatron_config.check_expert_grid(world_size, f"trainer.{role}.megatron_config")
+    return world_size // (pp * cp * tp)
+
+
 def validate_batch_sizes(cfg: SkyRLTrainConfig):
     """
     Validate configured batch sizes.
@@ -111,14 +136,7 @@ def validate_batch_sizes(cfg: SkyRLTrainConfig):
     policy_world_size = cfg.trainer.placement.policy_num_nodes * cfg.trainer.placement.policy_num_gpus_per_node
 
     if cfg.trainer.strategy == "megatron":
-        pp = cfg.trainer.policy.megatron_config.pipeline_model_parallel_size
-        cp = cfg.trainer.policy.megatron_config.context_parallel_size
-        tp = cfg.trainer.policy.megatron_config.tensor_model_parallel_size
-        assert policy_world_size % (pp * cp * tp) == 0, (
-            f"policy_world_size {policy_world_size} should be divisible by (pp * cp * tp) {pp * cp * tp}. "
-            "This ensures that the data parallel size is an integer."
-        )
-        policy_dp_size = policy_world_size // (pp * cp * tp)
+        policy_dp_size = _megatron_dp_size("policy", policy_world_size, cfg.trainer.policy.megatron_config)
     else:
         policy_dp_size = policy_world_size // cfg.trainer.policy.sequence_parallel_size
 
@@ -199,14 +217,7 @@ def validate_batch_sizes(cfg: SkyRLTrainConfig):
     if use_ref_model:
         ref_world_size = cfg.trainer.placement.ref_num_nodes * cfg.trainer.placement.ref_num_gpus_per_node
         if cfg.trainer.strategy == "megatron":
-            pp = cfg.trainer.ref.megatron_config.pipeline_model_parallel_size
-            cp = cfg.trainer.ref.megatron_config.context_parallel_size
-            tp = cfg.trainer.ref.megatron_config.tensor_model_parallel_size
-            assert ref_world_size % (pp * cp * tp) == 0, (
-                f"ref_world_size {ref_world_size} should be divisible by (pp * cp * tp) {pp * cp * tp}. "
-                "This ensures that the data parallel size is an integer."
-            )
-            ref_dp_size = ref_world_size // (pp * cp * tp)
+            ref_dp_size = _megatron_dp_size("ref", ref_world_size, cfg.trainer.ref.megatron_config)
         else:
             ref_dp_size = ref_world_size // cfg.trainer.ref.sequence_parallel_size
         lcm_dp_size = math.lcm(lcm_dp_size, ref_dp_size)
@@ -387,6 +398,140 @@ def _validate_draft_weight_sync_cfg(cfg: SkyRLTrainConfig):
         )
 
 
+def _validate_expert_nvfp4_cfg(cfg: SkyRLTrainConfig):
+    """Check ``trainer.policy.megatron_config.expert_nvfp4`` against the training setup and the rollouts it must
+    match (``workers/megatron/quantization/expert_nvfp4.py``)."""
+    from skyrl.backends.skyrl_train.workers.megatron.quantization.expert_nvfp4 import (
+        EXPERT_NVFP4_MODE_W4A4,
+        EXPERT_NVFP4_MODES,
+    )
+
+    mc = cfg.trainer.policy.megatron_config
+    if not mc.expert_nvfp4:
+        return
+    name = "trainer.policy.megatron_config.expert_nvfp4"
+    if cfg.trainer.strategy != "megatron":
+        raise ValueError(f"{name} needs trainer.strategy=megatron")
+    if mc.expert_nvfp4_mode not in EXPERT_NVFP4_MODES:
+        raise ValueError(f"{name}_mode must be one of {list(EXPERT_NVFP4_MODES)}, got {mc.expert_nvfp4_mode!r}")
+    ie_cfg = cfg.generator.inference_engine
+    if ie_cfg.fp8_weight_sync_mode is not None:
+        raise ValueError(
+            f"{name} ships its own ModelOpt NVFP4 experts and is mutually exclusive with fp8_weight_sync_mode"
+        )
+    from skyrl.backends.skyrl_train.weight_sync import get_transfer_strategy
+
+    backend = get_transfer_strategy(ie_cfg.weight_sync_backend, cfg.trainer.placement.colocate_all)
+    if backend not in {"nccl", "ipc"}:
+        raise ValueError(f"{name} weight sync needs the NCCL or CUDA-IPC backend, got {backend!r}")
+    policy_cfg = cfg.trainer.policy
+    if policy_cfg.model.lora.rank > 0 or policy_cfg.model.fake_int4_qat.enabled:
+        raise ValueError(f"{name} requires full-parameter training without fake_int4_qat")
+    if cfg.trainer.mtp.enabled:
+        raise ValueError(f"{name} does not support MTP training or draft sync")
+    if not mc.moe_grouped_gemm:
+        raise ValueError(f"{name} requires moe_grouped_gemm=true")
+    kwargs = mc.transformer_config_kwargs
+    # Megatron turns FP8 / FP4 on for any value but None (``config.fp8 is not None``), ``False`` included.
+    if kwargs.get("fp8") is not None or kwargs.get("fp4") is not None:
+        raise ValueError(
+            f"{name} needs BF16 expert compute: leave trainer.policy.megatron_config.fp8 and transformer_config_kwargs "
+            f"fp8 / fp4 unset (None), which Megatron reads as on for any other value, False included; got "
+            f"fp8={kwargs.get('fp8')!r} fp4={kwargs.get('fp4')!r}"
+        )
+    if kwargs.get("quant_recipe") is not None:
+        raise ValueError(f"{name} conflicts with a quant_recipe")
+    # Each expert's global (per-tensor) scale must come from the whole matrix, as on the sampler.
+    etp = mc.expert_tensor_parallel_size or mc.tensor_model_parallel_size
+    if etp != 1:
+        unset = "" if mc.expert_tensor_parallel_size else ", which Megatron takes from tensor_model_parallel_size"
+        raise ValueError(
+            f"{name} needs whole experts per rank: set trainer.policy.megatron_config.expert_tensor_parallel_size: 1 "
+            f"(got {etp}{unset})"
+        )
+    # The trainer's own rounding: 4/6 defaults to the rollouts' grid (expert_nvfp4_block_scale); another setting is kept.
+    rollouts_46 = mc.expert_nvfp4_block_scale == BLOCK_SCALE_FOUR_OVER_SIX
+    for rounding, field_name in (
+        (mc.expert_nvfp4_weight_rounding, "expert_nvfp4_weight_rounding"),
+        (mc.expert_nvfp4_activation_rounding, "expert_nvfp4_activation_rounding"),
+    ):
+        if rounding.four_over_six is None:
+            rounding.four_over_six = rollouts_46
+        elif rounding.four_over_six != rollouts_46:
+            logger.warning(
+                f"trainer.policy.megatron_config.{field_name}.four_over_six={rounding.four_over_six} differs from the "
+                f"rollouts' expert_nvfp4_block_scale={mc.expert_nvfp4_block_scale!r}: the trainer rounds to another grid"
+            )
+    if mc.expert_nvfp4_mode != EXPERT_NVFP4_MODE_W4A4 and mc.expert_nvfp4_activation_rounding.stochastic_rounding:
+        raise ValueError(
+            "trainer.policy.megatron_config.expert_nvfp4_activation_rounding.stochastic_rounding rounds the expert "
+            "inputs, which only expert_nvfp4_mode=w4a4 does"
+        )
+    if mc.expert_nvfp4_mode == EXPERT_NVFP4_MODE_W4A4:
+        # The trainer (expert TP 1) quantizes each fc2 input per token over the whole intermediate row. vLLM does the
+        # same under expert parallelism, but over a 1/R shard when its experts are tensor-sharded R ways (DP x TP).
+        shards = 1 if ie_cfg.expert_parallel_size > 1 else ie_cfg.data_parallel_size * ie_cfg.tensor_parallel_size
+        if shards != 1:
+            raise ValueError(
+                f"{name}_mode=w4a4 cannot match the rollouts' per-token fc2-input scales: vLLM shards each expert's "
+                f"intermediate {shards} ways (no expert parallelism; DP x TP), the trainer holds whole rows. Use "
+                "expert parallelism on the engines (generator.inference_engine.expert_parallel_size), or "
+                "expert_nvfp4_mode=w4a16."
+            )
+
+
+def _apply_kv_cache_qat_cfg(cfg: SkyRLTrainConfig) -> None:
+    """Check ``trainer.policy.megatron_config.kv_cache_qat`` against the engines' KV cache, and copy its format to
+    ``kv_cache_qat_format``."""
+    from skyrl.backends.skyrl_train.workers.megatron.quantization.fake_kv_cache_qat import (
+        KvCacheFormat,
+    )
+
+    mc = cfg.trainer.policy.megatron_config
+    name = "trainer.policy.megatron_config.kv_cache_qat"
+    rounding = mc.kv_cache_qat_rounding
+    if not mc.kv_cache_qat:
+        if mc.kv_cache_qat_format is not None:
+            raise ValueError(f"{name}_format is set but {name} is off")
+        if rounding.four_over_six or rounding.stochastic_rounding:
+            raise ValueError(f"{name}_rounding is set but {name} is off")
+        return
+    if cfg.trainer.strategy != "megatron":
+        raise ValueError(f"{name} needs trainer.strategy=megatron")
+    ie_cfg = cfg.generator.inference_engine
+    if ie_cfg.enable_pd:
+        raise ValueError(
+            f"{name} does not support prefill-decode disaggregation (generator.inference_engine.enable_pd=true)"
+        )
+    engine_kwargs = ie_cfg.engine_init_kwargs
+    kv_dtype = engine_kwargs.get("kv_cache_dtype", "auto")
+    if kv_dtype not in tuple(KvCacheFormat):
+        raise ValueError(
+            f"{name} emulates the engines' quantized KV cache, which must be one of {[f.value for f in KvCacheFormat]} "
+            f"(generator.inference_engine.engine_init_kwargs.kv_cache_dtype), got {kv_dtype!r}"
+        )
+    attention_config = engine_kwargs.get("attention_config") or {}
+    if not attention_config.get("sparse_mla_force_mqa", False):
+        raise ValueError(
+            f"{name} needs engine_init_kwargs.attention_config.sparse_mla_force_mqa: true; without it vLLM runs short "
+            "prefills on the fresh bf16 keys instead of the cache rows the trainer emulates"
+        )
+    if mc.kv_cache_qat_format not in (None, kv_dtype):
+        raise ValueError(
+            f"{name}_format={mc.kv_cache_qat_format!r} disagrees with the engines' kv_cache_dtype {kv_dtype!r}"
+        )
+    mc.kv_cache_qat_format = kv_dtype
+    if rounding.four_over_six is None:
+        rounding.four_over_six = False  # vLLM's cache writer: absmax
+    elif rounding.four_over_six:
+        if kv_dtype != KvCacheFormat.NVFP4_DS_MLA:
+            raise ValueError(f"{name}_rounding.four_over_six applies to nvfp4_ds_mla only, got {kv_dtype!r}")
+        logger.warning(
+            f"{name}_rounding.four_over_six=true: the trainer rounds its cache rows with 4/6 block scales, the rollouts' "
+            "vLLM cache with absmax"
+        )
+
+
 def validate_step_timeouts(step_timeout_s: Optional[float], weight_sync_timeout_s: Optional[float]) -> None:
     for name, value in (("step_timeout_s", step_timeout_s), ("weight_sync_timeout_s", weight_sync_timeout_s)):
         if value is None:
@@ -453,6 +598,8 @@ def validate_cfg(cfg: SkyRLTrainConfig):
     # side (vLLM MTP speculative decoding) so both stay consistent.
     _apply_mtp_config(cfg)
     _validate_draft_weight_sync_cfg(cfg)
+    _validate_expert_nvfp4_cfg(cfg)
+    _apply_kv_cache_qat_cfg(cfg)
 
     from skyrl.backends.skyrl_train.utils.ppo_utils import (
         AdvantageEstimatorRegistry,
@@ -697,6 +844,37 @@ def validate_generator_cfg(cfg: SkyRLTrainConfig):
     # Validate inference-engine instantiation / serving topology (shared with
     # the inference-only serve entrypoint).
     validate_inference_engine_cfg(cfg)
+    _validate_vlm_lora_cfg(cfg)
+
+
+def _validate_vlm_lora_cfg(cfg: SkyRLTrainConfig):
+    """Require vLLM visual-adapter support for full-VLM FSDP LoRA training."""
+    policy_cfg = cfg.trainer.policy
+    ie_cfg = cfg.generator.inference_engine
+    if (
+        cfg.trainer.strategy != "fsdp"
+        or policy_cfg.model.lora.rank <= 0
+        or policy_cfg.language_model_only
+        or ie_cfg.backend != "vllm"
+    ):
+        return
+
+    if not check_is_vlm(policy_cfg.model.path):
+        return
+
+    kwargs_names = (
+        ("prefill_init_kwargs", "decode_init_kwargs")
+        if ie_cfg.prefill_init_kwargs or ie_cfg.decode_init_kwargs
+        else ("engine_init_kwargs",)
+    )
+    for kwargs_name in kwargs_names:
+        if (getattr(ie_cfg, kwargs_name) or {}).get("enable_tower_connector_lora") is not True:
+            raise ValueError(
+                "Full-VLM FSDP LoRA training requires "
+                f"generator.inference_engine.{kwargs_name}.enable_tower_connector_lora=true "
+                "so vLLM applies the visual adapters during rollouts. "
+                "Set this flag explicitly; otherwise vLLM may silently omit visual adapters."
+            )
 
 
 def validate_inference_engine_cfg(cfg: SkyRLTrainConfig):
@@ -1055,6 +1233,12 @@ def prepare_runtime_environment(cfg: SkyRLTrainConfig) -> dict[str, str]:
         # Engram table placement, faulthandler).
         env_vars.update({k: v for k, v in os.environ.items() if k.startswith("SKYRL_DSV41_")})
 
+        # Expert NVFP4: FlashInfer's NVFP4 env for the engines' per-token activation quantization (the trainer sets
+        # it around its own launches), every key explicit so stray shell values cannot change the grid.
+        megatron_cfg = cfg.trainer.policy.megatron_config
+        if megatron_cfg.expert_nvfp4:
+            env_vars.update(flashinfer_nvfp4_env(megatron_cfg.expert_nvfp4_block_scale == BLOCK_SCALE_FOUR_OVER_SIX))
+
     if cfg.generator.inference_engine.backend == "vllm":
         env_vars["VLLM_ALLOW_RUNTIME_LORA_UPDATING"] = "true"
 
@@ -1374,21 +1558,39 @@ def initialize_ray(cfg: SkyRLTrainConfig):
     sync_registries()
 
 
-def get_ray_pg_ready_with_timeout(pg: PlacementGroup, timeout: int = 60):
-    try:
-        ray.get(pg.ready(), timeout=timeout)
-    except Exception as e:
-        # Extract resource demands from the placement group
-        bundles = pg.bundle_specs
-        total_gpus = sum(bundle.get("GPU", 0) for bundle in bundles)
-        total_cpus = sum(bundle.get("CPU", 0) for bundle in bundles)
+@contextmanager
+def cleanup_on_error(cleanup: Callable[[], Any], description: str):
+    """Run ``cleanup`` if the body raises, then re-raise the body's exception.
 
-        raise RuntimeError(
-            f"Failed to create placement group with {len(bundles)} bundles "
-            f"(requiring {total_gpus} GPUs, {total_cpus} CPUs total) in {timeout} seconds. "
-            f"This might indicate insufficient GPU resources.\n"
-            f"Error: {e}"
-        )
+    A failure in ``cleanup`` is attached to that exception as a note instead of replacing it.
+    """
+    try:
+        yield
+    except BaseException as primary:
+        try:
+            cleanup()
+        except Exception as cleanup_exc:
+            primary.add_note(f"{description} also failed during cleanup: {cleanup_exc!r}")
+        raise
+
+
+def get_ray_pg_ready_with_timeout(pg: PlacementGroup, timeout: int = 60):
+    """Wait until ``pg`` is ready, removing it if that does not happen within ``timeout`` seconds."""
+    with cleanup_on_error(lambda: remove_placement_group(pg), "Removing the placement group"):
+        try:
+            ray.get(pg.ready(), timeout=timeout)
+        except Exception as e:
+            # Extract resource demands from the placement group
+            bundles = pg.bundle_specs
+            total_gpus = sum(bundle.get("GPU", 0) for bundle in bundles)
+            total_cpus = sum(bundle.get("CPU", 0) for bundle in bundles)
+
+            raise RuntimeError(
+                f"Failed to create placement group with {len(bundles)} bundles "
+                f"(requiring {total_gpus} GPUs, {total_cpus} CPUs total) in {timeout} seconds. "
+                f"This might indicate insufficient GPU resources.\n"
+                f"Error: {e}"
+            )
 
 
 @ray.remote(num_gpus=1)

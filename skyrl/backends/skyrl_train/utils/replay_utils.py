@@ -234,7 +234,8 @@ def setup_per_microbatch_replay_forward(
         raise ValueError("rollout_expert_indices and router_padding_mask must be on the same device")
 
     num_captured_layers, topk = rollout_expert_indices.row_shape
-    instances = RouterReplay.global_router_replay_instances
+    # The MTP heads' routers route on their own: vLLM captures routes for the target model's layers only.
+    instances = RouterReplay.get_instances(is_mtp_layer=False)
     local_layer_indices = _get_local_router_layer_indices(
         model_config,
         num_captured_layers,
@@ -269,8 +270,9 @@ def setup_per_microbatch_replay_forward(
         aligned_rollout_expert_indices = aligned_rollout_expert_indices[
             :, tp_rank * chunk_size : (tp_rank + 1) * chunk_size, :, :
         ]
-    RouterReplay.set_replay_data(_split_replay_indices(aligned_rollout_expert_indices))
-    RouterReplay.set_global_router_replay_action(RouterReplayAction.REPLAY_FORWARD)
+    for instance, indices in zip(instances, _split_replay_indices(aligned_rollout_expert_indices), strict=True):
+        instance.set_target_indices(indices)
+    RouterReplay.set_global_router_replay_action(RouterReplayAction.REPLAY_FORWARD, is_mtp_layer=False)
 
     model_router_padding_mask = scatter_router_padding_mask_for_model(
         aligned_router_padding_mask,
@@ -290,7 +292,7 @@ def setup_per_microbatch_replay_backward() -> None:
         RouterReplayAction,
     )
 
-    RouterReplay.set_global_router_replay_action(RouterReplayAction.REPLAY_BACKWARD)
+    RouterReplay.set_global_router_replay_action(RouterReplayAction.REPLAY_BACKWARD, is_mtp_layer=False)
 
 
 def clear_router_replay():

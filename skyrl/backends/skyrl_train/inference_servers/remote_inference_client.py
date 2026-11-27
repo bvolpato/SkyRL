@@ -50,6 +50,7 @@ import asyncio
 import contextlib
 import json
 import logging
+import time
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import (
@@ -316,10 +317,14 @@ class RemoteGenerateClient:
     ) -> Any:
         """POST JSON with retries, optionally splicing packed arrays before parsing."""
         session = await self._get_session()
+        # Encode once, with orjson: a long-context request is ~100k+ token ids, which stdlib json (aiohttp's
+        # json=) encodes ~6x slower (~7 ms vs ~1.2 ms at 155k tokens), all on the client's single event loop.
+        data = orjson.dumps(json, option=orjson.OPT_NON_STR_KEYS | orjson.OPT_SERIALIZE_NUMPY)
+        headers = {"Content-Type": "application/json", **(headers or {})}
         last_exc: Optional[Exception] = None
         for attempt in range(_DATA_PLANE_RETRIES):
             try:
-                async with session.post(url, json=json, headers=headers) as resp:
+                async with session.post(url, data=data, headers=headers) as resp:
                     try:
                         raw = await resp.read()
                         body = load_packed_body(raw) if packed_side_channels else orjson.loads(raw)
@@ -543,6 +548,11 @@ class RemoteInferenceClient(InferenceEngineInterface):
 
     # Private fields excluded from repr for cleaner output
     _generate_client: Optional[RemoteGenerateClient] = field(default=None, repr=False)
+    # True from `sleep_with_frozen_requests` until `resume`. The inference engines then hold paused
+    # requests, and only `wake_for_weight_sync` and `resume_generation` can wake them.
+    _requests_frozen_asleep: bool = field(default=False, repr=False)
+    # Whether the last `sleep_with_frozen_requests` copied the KV cache to host memory.
+    _frozen_kv_offloaded: bool = field(default=True, repr=False)
     _world_size: Optional[Tuple[int, int]] = field(default=None, repr=False)
     _gen_sem: Optional[asyncio.Semaphore] = field(default=None, repr=False)
     _detok_sem: Optional[asyncio.Semaphore] = field(default=None, repr=False)
@@ -1267,7 +1277,9 @@ class RemoteInferenceClient(InferenceEngineInterface):
 
     async def resume(self) -> Dict[str, Any]:
         """Resume generation on all backends."""
-        return await self._call_all_servers("/resume")
+        ret = await self._call_all_servers("/resume")
+        self._requests_frozen_asleep = False
+        return ret
 
     async def pause_generation(self, clear_cache: bool = False) -> Dict[str, Any]:
         """Pause using keep mode."""
@@ -1320,7 +1332,7 @@ class RemoteInferenceClient(InferenceEngineInterface):
         params = {"tags": tags} if tags else {}
         return await self._call_all_servers("/wake_up", params=params)
 
-    async def sleep_for_weight_sync(self, offload_kv: bool = True) -> Dict[str, Any]:
+    async def sleep_for_weight_sync(self, offload_kv: bool = True, offload_weights: bool = False) -> Dict[str, Any]:
         """Free GPU memory for weight sync while keeping in-flight requests frozen.
 
         Sleeps the allocator via ``/collective_rpc`` without touching the scheduler
@@ -1329,10 +1341,62 @@ class RemoteInferenceClient(InferenceEngineInterface):
         from it; set False to discard it (e.g. when the sync will reset it anyway).
         Pair with :meth:`wake_for_weight_sync`; the caller must KEEP-pause before and
         ``resume`` after.
+
+        The sleep discards the weights by default, because a full-weight sync sends every
+        parameter again. ``offload_weights=True`` copies them to host memory instead, and
+        the wake restores them. Set it when the sync sends LoRA adapters only.
         """
         return await self._call_all_servers(
             "/collective_rpc",
-            {"method": "skyrl_sleep_for_weight_sync", "kwargs": {"offload_kv": offload_kv}},
+            {
+                "method": "skyrl_sleep_for_weight_sync",
+                "kwargs": {"offload_kv": offload_kv, "offload_weights": offload_weights},
+            },
+        )
+
+    @property
+    def requests_frozen_asleep(self) -> bool:
+        """Whether the inference engines sleep with paused requests (see :meth:`sleep_with_frozen_requests`)."""
+        return self._requests_frozen_asleep
+
+    @property
+    def frozen_kv_offloaded(self) -> bool:
+        """Whether the last :meth:`sleep_with_frozen_requests` copied the KV cache to host memory.
+
+        When it is false, the inference engines discarded the KV cache. The weight sync must then
+        reset the prefix cache before the resume."""
+        return self._frozen_kv_offloaded
+
+    async def sleep_with_frozen_requests(self, offload_kv: bool = True) -> None:
+        """Pause the in-flight requests in the inference engines, then free the GPU memory.
+
+        Unlike :meth:`sleep`, this method aborts no request. The inference engine keeps each request
+        paused. ``offload_kv=True`` copies the key-value (KV) cache to host memory, so the requests
+        continue from it. ``offload_kv=False`` discards the KV cache. The weight sync must then reset
+        the prefix cache with ``reset_running_requests=True``, so that the inference engine prefills
+        the paused requests again. ``WorkerDispatch.save_weights_for_sampler`` rejects a weight sync
+        that does not (see :attr:`frozen_kv_offloaded`).
+        When the trainer syncs LoRA adapters only (``uses_lora_weight_sync``), the sleep also copies
+        the weights to host memory, because the sync does not send the base model again.
+
+        To wake, call ``wake_for_weight_sync(["weights"])``, send the weights,
+        call ``wake_for_weight_sync(["kv_cache"])``, then :meth:`resume_generation`.
+        ``WorkerDispatch.save_weights_for_sampler`` runs this sequence while
+        :attr:`requests_frozen_asleep` is true.
+        """
+        pause_start = time.perf_counter()
+        await self.pause_generation()
+        pause_seconds = time.perf_counter() - pause_start
+        sleep_start = time.perf_counter()
+        # A LoRA adapter sync does not send the base model again, so the sleep must keep it.
+        offload_weights = self.uses_lora_weight_sync
+        await self.sleep_for_weight_sync(offload_kv=offload_kv, offload_weights=offload_weights)
+        self._requests_frozen_asleep = True
+        self._frozen_kv_offloaded = offload_kv
+        logger.info(
+            f"Engines asleep with frozen requests: pause(keep) took {pause_seconds:.2f} s, "
+            f"allocator sleep (offload_kv={offload_kv}, offload_weights={offload_weights}) "
+            f"took {time.perf_counter() - sleep_start:.2f} s."
         )
 
     async def wake_for_weight_sync(self, tags: List[str]) -> Dict[str, Any]:
