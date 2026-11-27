@@ -15,6 +15,7 @@ from skyrl.backends.skyrl_train.distributed.megatron import quantization_utils
 from skyrl.train.config.config import (
     BaseConfig,
     DeltaWeightSyncConfig,
+    MegatronConfig,
     PolicyConfig,
     SkyRLTrainConfig,
     TrainerConfig,
@@ -22,10 +23,13 @@ from skyrl.train.config.config import (
     build_nested_dataclass,
     overrides_dict_to_dotlist,
 )
+from skyrl.train.config.sft_config import SFTConfig
 from skyrl.train.utils import utils as train_utils
 from skyrl.train.utils.utils import (
+    _validate_expert_nvfp4_cfg,
     prepare_runtime_environment,
     validate_cfg,
+    validate_generator_cfg,
     validate_inference_engine_cfg,
     validate_megatron_cfg,
     validate_optimizer_offload_to_disk_cfg,
@@ -47,6 +51,55 @@ def _make_validated_test_config():
     cfg.trainer.policy_mini_batch_size = cfg.trainer.train_batch_size
     cfg.trainer.critic_mini_batch_size = cfg.trainer.train_batch_size
     return cfg
+
+
+def test_vlm_lora_requires_explicit_tower_support(monkeypatch):
+    monkeypatch.setattr(train_utils, "check_is_vlm", lambda _: True)
+    cfg = _make_validated_test_config()
+    cfg.trainer.strategy = "fsdp"
+    cfg.trainer.policy.model.lora.rank = 8
+    cfg.generator.max_input_length = cfg.trainer.max_prompt_length
+
+    with pytest.raises(ValueError, match=r"engine_init_kwargs.enable_tower_connector_lora=true"):
+        validate_generator_cfg(cfg)
+
+
+def test_vlm_lora_accepts_explicit_tower_support(monkeypatch):
+    monkeypatch.setattr(train_utils, "check_is_vlm", lambda _: True)
+    cfg = _make_validated_test_config()
+    cfg.trainer.strategy = "fsdp"
+    cfg.trainer.policy.model.lora.rank = 8
+    cfg.generator.max_input_length = cfg.trainer.max_prompt_length
+    cfg.generator.inference_engine.engine_init_kwargs["enable_tower_connector_lora"] = True
+
+    validate_generator_cfg(cfg)
+
+
+def test_vlm_lora_pd_requires_tower_support_on_both_roles(monkeypatch):
+    monkeypatch.setattr(train_utils, "check_is_vlm", lambda _: True)
+    cfg = _make_validated_test_config()
+    cfg.trainer.strategy = "fsdp"
+    cfg.trainer.policy.model.lora.rank = 8
+    cfg.generator.max_input_length = cfg.trainer.max_prompt_length
+    ie_cfg = cfg.generator.inference_engine
+    ie_cfg.enable_pd = True
+    ie_cfg.num_engines = 2
+    ie_cfg.num_prefill = 1
+    for role in ("prefill", "decode"):
+        setattr(
+            ie_cfg,
+            f"{role}_init_kwargs",
+            {"kv_transfer_config": {"kv_connector": "NixlConnector"}, "enable_tower_connector_lora": True},
+        )
+
+    validate_generator_cfg(cfg)
+
+    for role in ("prefill", "decode"):
+        kwargs = getattr(ie_cfg, f"{role}_init_kwargs")
+        del kwargs["enable_tower_connector_lora"]
+        with pytest.raises(ValueError, match=rf"{role}_init_kwargs.enable_tower_connector_lora=true"):
+            validate_generator_cfg(cfg)
+        kwargs["enable_tower_connector_lora"] = True
 
 
 # Helper dataclasses for testing
@@ -470,6 +523,19 @@ def test_megatron_rejects_fp8_only_settings_without_fp8(kwargs):
     MegatronConfig(transformer_config_kwargs={"fp8": "e4m3"}, **kwargs)
 
 
+def test_expert_nvfp4_uses_the_bf16_layer_counts_and_rejects_fp8_module_exclusions():
+    from skyrl.train.config.config import MegatronConfig
+
+    cfg = MegatronConfig(expert_nvfp4=True, num_layers_at_start_in_bf16=1, num_layers_at_end_in_bf16=7)
+    assert cfg.transformer_config_kwargs["first_last_layers_bf16"] is True
+    assert cfg.transformer_config_kwargs["num_layers_at_start_in_bf16"] == 1
+    assert cfg.transformer_config_kwargs["num_layers_at_end_in_bf16"] == 7
+    with pytest.raises(ValueError, match="expert_nvfp4"):
+        MegatronConfig(expert_nvfp4=True, fp8_exclude_modules=["*.shared_experts.*"])
+    with pytest.raises(ValueError, match="expert_nvfp4"):
+        MegatronConfig(expert_nvfp4=True, te_precision_config_file="/tmp/recipe.yaml")
+
+
 def test_fp8_weight_sync_exclusions_require_fp8_weight_sync():
     cfg = _make_validated_test_config()
     cfg.trainer.strategy = "megatron"
@@ -548,6 +614,28 @@ def test_megatron_empty_cuda_cache_from_cli_override():
     )
     assert cfg.trainer.policy.megatron_config.empty_cuda_cache is None
     assert cfg.trainer.policy.megatron_config.empty_cuda_cache_after_backward() is False
+
+
+@pytest.mark.parametrize(
+    ("config_cls", "prefix"),
+    [
+        (SkyRLTrainConfig, "trainer.policy.megatron_config"),
+        (SkyRLTrainConfig, "trainer.ref.megatron_config"),
+        (SFTConfig, "megatron_config"),
+    ],
+)
+@pytest.mark.parametrize("key", ["rope_theta", "rope_parameters.rope_theta", "rope_scaling.factor", "q_lora_rank"])
+def test_megatron_config_rejects_unapplied_overrides_in_model_config(config_cls, prefix, key):
+    # Every entrypoint builds a MegatronConfig, including SFT and Tinker, which never call validate_cfg.
+    with pytest.raises(ValueError, match="megatron_config.model_config_kwargs.model_config sets"):
+        config_cls.from_cli_overrides([f"{prefix}.model_config_kwargs.model_config.{key}=500000.0"])
+
+
+@pytest.mark.parametrize(
+    "model_config_kwargs", [{"model_config": {"vocab_size": 151936}}, {"model_config": None}, {}, None]
+)
+def test_megatron_config_allows_other_model_config_overrides(model_config_kwargs):
+    MegatronConfig(model_config_kwargs=model_config_kwargs)
 
 
 def test_megatron_validation_allows_inference_only_fp8_param_without_gather():
@@ -1913,3 +2001,188 @@ def test_optimizer_offload_to_disk_rejects_settings_it_cannot_honor(overrides, m
 
     with pytest.raises(ValueError, match=match):
         validate_optimizer_offload_to_disk_cfg(cfg)
+
+
+def test_expert_nvfp4_stacked_sync_default_on_and_ignored_without_expert_nvfp4():
+    cfg = _make_validated_test_config()
+    cfg.trainer.strategy = "megatron"
+    assert cfg.trainer.policy.megatron_config.expert_nvfp4_stacked_sync is True
+    assert cfg.trainer.policy.megatron_config.expert_nvfp4 is False
+    validate_megatron_cfg(cfg)  # a no-op without expert_nvfp4: must not raise
+
+
+def _expert_nvfp4_config(mode="w4a16"):
+    cfg = _make_validated_test_config()
+    cfg.trainer.strategy = "megatron"
+    cfg.trainer.policy.megatron_config.expert_nvfp4 = True
+    cfg.trainer.policy.megatron_config.expert_nvfp4_mode = mode
+    return cfg
+
+
+# FlashInfer's whole NVFP4 env, every value explicit (only "1" is true for FlashInfer).
+_FI_ENV = {
+    "FLASHINFER_NVFP4_4OVER6_ERR_MODE": "MSE",
+    "FLASHINFER_NVFP4_4OVER6_ERR_USE_FAST_MATH": "1",
+    "FLASHINFER_NVFP4_4OVER6_E4M3_USE_256": "0",
+    "FLASHINFER_DISABLE_FP4_QUANT_FAST_MATH": "0",
+    "TRTLLM_DISABLE_FP4_QUANT_FAST_MATH": "0",
+}
+
+
+def _nvfp4_env(env_vars):
+    return {
+        k: v for k, v in env_vars.items() if k.startswith(("FLASHINFER_", "TRTLLM_", "NVTE_NVFP4", "NVTE_BACKWARD"))
+    }
+
+
+def test_expert_nvfp4_defaults_to_w4a16_with_four_over_six():
+    cfg = SkyRLTrainConfig.from_cli_overrides(
+        ["trainer.strategy=megatron", "trainer.policy.megatron_config.expert_nvfp4=true"]
+    )
+    mc = cfg.trainer.policy.megatron_config
+    assert (mc.expert_nvfp4_mode, mc.expert_nvfp4_block_scale) == ("w4a16", "four_over_six")
+
+
+@pytest.mark.parametrize("block_scale", ["absmax", "four_over_six"])
+def test_expert_nvfp4_trainer_rounding_defaults_to_the_rollouts_grid(block_scale):
+    """``expert_nvfp4_*_rounding.four_over_six`` follows ``expert_nvfp4_block_scale`` unless set; stochastic rounding
+    is off by default."""
+    cfg = _expert_nvfp4_config("w4a4")
+    mc = cfg.trainer.policy.megatron_config
+    mc.expert_nvfp4_block_scale = block_scale
+    _validate_expert_nvfp4_cfg(cfg)
+    for rounding in (mc.expert_nvfp4_weight_rounding, mc.expert_nvfp4_activation_rounding):
+        assert rounding.four_over_six is (block_scale == "four_over_six") and rounding.stochastic_rounding is False
+
+
+@pytest.mark.parametrize("field", ["expert_nvfp4_weight_rounding", "expert_nvfp4_activation_rounding"])
+def test_expert_nvfp4_trainer_rounding_may_differ_from_the_rollouts(field):
+    cfg = _expert_nvfp4_config("w4a4")
+    rounding = getattr(cfg.trainer.policy.megatron_config, field)
+    rounding.four_over_six, rounding.stochastic_rounding = False, True
+    _validate_expert_nvfp4_cfg(cfg)
+    assert rounding.four_over_six is False and rounding.stochastic_rounding is True
+
+
+def test_expert_nvfp4_stochastic_inputs_need_w4a4():
+    cfg = _expert_nvfp4_config("w4a16")
+    cfg.trainer.policy.megatron_config.expert_nvfp4_activation_rounding.stochastic_rounding = True
+    with pytest.raises(ValueError, match="only expert_nvfp4_mode=w4a4"):
+        _validate_expert_nvfp4_cfg(cfg)
+
+
+@pytest.mark.parametrize("mode", ["w4a16", "w4a4"])
+@pytest.mark.parametrize("colocated", [False, True])
+def test_expert_nvfp4_accepts_packed_push_backends(colocated, mode):
+    cfg = _expert_nvfp4_config(mode)
+    cfg.trainer.placement.colocate_all = colocated
+    _validate_expert_nvfp4_cfg(cfg)
+
+
+@pytest.mark.parametrize(
+    "overrides, message",
+    [
+        ({"trainer.strategy": "fsdp"}, "trainer.strategy=megatron"),
+        ({"trainer.policy.megatron_config.expert_nvfp4_mode": "bogus"}, "expert_nvfp4_mode must be one of"),
+        ({"generator.inference_engine.weight_sync_backend": "sharded_rdt"}, "NCCL or CUDA-IPC"),
+        ({"generator.inference_engine.weight_sync_backend": "delta"}, "NCCL or CUDA-IPC"),
+        ({"generator.inference_engine.fp8_weight_sync_mode": "fp8"}, "mutually exclusive"),
+        ({"trainer.policy.model.lora.rank": 8}, "full-parameter"),
+        ({"trainer.policy.megatron_config.moe_grouped_gemm": False}, "moe_grouped_gemm"),
+        ({"trainer.policy.megatron_config.expert_tensor_parallel_size": 2}, "expert_tensor_parallel_size: 1"),
+        ({"trainer.policy.megatron_config.tensor_model_parallel_size": 2}, "takes from tensor_model_parallel_size"),
+        ({"trainer.policy.megatron_config.transformer_config_kwargs": {"quant_recipe": {}}}, "quant_recipe"),
+        ({"trainer.mtp.enabled": True}, "MTP"),
+    ],
+)
+def test_expert_nvfp4_rejects_unsupported_setups(overrides, message):
+    cfg = _expert_nvfp4_config()
+    for path, value in overrides.items():
+        *parents, leaf = path.split(".")
+        setattr(_get_nested_attr(cfg, ".".join(parents)), leaf, value)
+    with pytest.raises(ValueError, match=message):
+        _validate_expert_nvfp4_cfg(cfg)
+
+
+@pytest.mark.parametrize("value", [False, "false", "e4m3", True])
+@pytest.mark.parametrize("key", ["fp8", "fp4"])
+def test_expert_nvfp4_rejects_any_set_fp8_or_fp4(key, value):
+    """Megatron enables FP8 / FP4 for any value but None, so even ``False`` is rejected at config time."""
+    cfg = _expert_nvfp4_config()
+    cfg.trainer.policy.megatron_config.transformer_config_kwargs[key] = value
+    with pytest.raises(ValueError, match=r"fp8 / fp4 unset \(None\)"):
+        _validate_expert_nvfp4_cfg(cfg)
+
+
+def test_expert_nvfp4_rejects_a_disabled_top_level_fp8():
+    """``megatron_config.fp8`` folds into ``transformer_config_kwargs["fp8"]`` whenever it is not None."""
+    from skyrl.train.config.config import MegatronConfig
+
+    cfg = _expert_nvfp4_config()
+    folded = MegatronConfig(expert_nvfp4=True, fp8="false").transformer_config_kwargs
+    cfg.trainer.policy.megatron_config.transformer_config_kwargs = folded
+    with pytest.raises(ValueError, match=r"fp8 / fp4 unset \(None\)"):
+        _validate_expert_nvfp4_cfg(cfg)
+
+
+def test_expert_nvfp4_accepts_unset_fp8_and_fp4():
+    cfg = _expert_nvfp4_config()
+    cfg.trainer.policy.megatron_config.transformer_config_kwargs.update(fp8=None, fp4=None)
+    _validate_expert_nvfp4_cfg(cfg)
+
+
+def test_expert_nvfp4_accepts_tensor_parallel_with_whole_experts():
+    cfg = _expert_nvfp4_config()
+    cfg.trainer.policy.megatron_config.tensor_model_parallel_size = 4
+    cfg.trainer.policy.megatron_config.expert_tensor_parallel_size = 1
+    _validate_expert_nvfp4_cfg(cfg)
+
+
+@pytest.mark.parametrize(
+    "rollout, ok",
+    [
+        (dict(expert_parallel_size=8, tensor_parallel_size=8, data_parallel_size=1), True),
+        (dict(expert_parallel_size=1, tensor_parallel_size=1, data_parallel_size=1), True),
+        (dict(expert_parallel_size=1, tensor_parallel_size=2, data_parallel_size=1), False),
+        (dict(expert_parallel_size=1, tensor_parallel_size=1, data_parallel_size=2), False),
+    ],
+)
+def test_expert_nvfp4_w4a4_needs_whole_fc2_input_rows_on_the_rollouts(rollout, ok):
+    """w4a4 rounds each fc2 input per token over the whole row, as vLLM does under expert parallelism; w4a16 rounds
+    no activations and takes any rollout layout."""
+    for mode in ("w4a16", "w4a4"):
+        cfg = _expert_nvfp4_config(mode)
+        for key, value in rollout.items():
+            setattr(cfg.generator.inference_engine, key, value)
+        if ok or mode == "w4a16":
+            _validate_expert_nvfp4_cfg(cfg)
+        else:
+            with pytest.raises(ValueError, match="cannot match the rollouts' per-token fc2-input scales"):
+                _validate_expert_nvfp4_cfg(cfg)
+
+
+def test_expert_nvfp4_validation_is_a_no_op_when_off():
+    cfg = _make_validated_test_config()
+    cfg.trainer.strategy = "megatron"
+    cfg.generator.inference_engine.weight_sync_backend = "sharded_rdt"
+    _validate_expert_nvfp4_cfg(cfg)
+
+
+@pytest.mark.parametrize("mode", ["w4a16", "w4a4"])
+@pytest.mark.parametrize("block_scale, four_over_six", [("four_over_six", "1"), ("absmax", "0")])
+def test_expert_nvfp4_runtime_environment_is_the_configs_flashinfer_env(monkeypatch, mode, block_scale, four_over_six):
+    """No TE recipe env (NVTE_NVFP4_* / NVTE_BACKWARD_OVERRIDE) is exported, and the engines' FlashInfer env follows
+    expert_nvfp4_block_scale with every key explicit, so a stray exact-math shell setting cannot leak in."""
+    monkeypatch.setattr(train_utils, "peer_access_supported", lambda **_kwargs: True)
+    monkeypatch.setenv("NVTE_NVFP4_4OVER6", "all")
+    monkeypatch.setenv("FLASHINFER_DISABLE_FP4_QUANT_FAST_MATH", "1")
+    cfg = _expert_nvfp4_config(mode)
+    cfg.trainer.policy.megatron_config.expert_nvfp4_block_scale = block_scale
+    assert _nvfp4_env(prepare_runtime_environment(cfg)) == {"FLASHINFER_NVFP4_4OVER6": four_over_six, **_FI_ENV}
+
+
+def test_runtime_environment_has_no_nvfp4_env_without_expert_nvfp4(monkeypatch):
+    monkeypatch.setattr(train_utils, "peer_access_supported", lambda **_kwargs: True)
+    cfg = _make_validated_test_config()
+    cfg.trainer.strategy = "megatron"
+    assert _nvfp4_env(prepare_runtime_environment(cfg)) == {}

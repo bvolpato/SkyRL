@@ -88,7 +88,9 @@ def _make_trainer(
     trainer._callback_handler = CallbackHandler()
     trainer.async_train_dataloader = _FakeAsyncDataloader()
     trainer._staleness_manager = SimpleNamespace(
-        notify_capacity_change=AsyncMock(), validate_state_at_epoch_end=AsyncMock()
+        notify_capacity_change=AsyncMock(),
+        validate_state_at_epoch_end=AsyncMock(),
+        _stat=SimpleNamespace(running=0),
     )
     trainer.dispatch = SimpleNamespace(
         save_weights_for_sampler=AsyncMock(),
@@ -201,6 +203,28 @@ async def test_hf_model_save_runs_after_eval_by_default():
     _, eval_end = trainer.intervals[("eval", 1)]
     save_start, _ = trainer.intervals[("save_hf_model", 1)]
     assert eval_end <= save_start
+
+
+@pytest.mark.asyncio
+async def test_checkpoint_before_weight_sync_does_not_save_during_eval():
+    """A trainer that saves before the weight sync keeps that order and does not save again during the eval."""
+    trainer = _make_trainer(save_during_eval=True, ckpt_interval=1)
+    trainer._checkpoint_before_weight_sync = lambda: True
+    sync_times = []
+
+    async def sync_weights():
+        sync_times.append(time.monotonic())
+
+    trainer._sync_weights_after_training_step = sync_weights
+
+    await trainer.train()
+
+    # A second save of the step would replace the recorded interval with one that starts after the weight sync.
+    _, ckpt_end = trainer.intervals[("save_checkpoints", 1)]
+    _, save_end = trainer.intervals[("save_hf_model", 1)]
+    eval_start, _ = trainer.intervals[("eval", 1)]
+    assert len(sync_times) == 1
+    assert ckpt_end <= save_end <= sync_times[0] <= eval_start
 
 
 @pytest.mark.asyncio

@@ -10,14 +10,14 @@ from omegaconf import OmegaConf
 
 pytest.importorskip("harbor")
 
-from examples.train_integrations.harbor import harbor_generator  # noqa: E402
 from examples.train_integrations.harbor.entrypoints.main_harbor import (  # noqa: E402
     HARBOR_DEFAULT_CONFIG,
 )
-from examples.train_integrations.harbor.harbor_generator import (  # noqa: E402
+from skyrl.integration.harbor import harbor_generator  # noqa: E402
+from skyrl.integration.harbor.harbor_generator import (  # noqa: E402
     HarborGenerator,
 )
-from examples.train_integrations.harbor.trial_metrics import (  # noqa: E402
+from skyrl.integration.harbor.trial_metrics import (  # noqa: E402
     TrialAttempts,
     _seconds,
     trial_metrics,
@@ -134,6 +134,7 @@ async def test_the_plain_harbor_generator_logs_a_start_timeout_rescued_by_a_retr
             "step_wise_trajectories": True,
             "merge_stepwise_output": True,
             "apply_overlong_filtering": False,
+            "timeout_mask_instance_fraction": 0.25,
             "rate_limit": None,
         }
     )

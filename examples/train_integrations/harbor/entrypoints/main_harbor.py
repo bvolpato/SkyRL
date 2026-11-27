@@ -15,8 +15,9 @@ from skyrl.train.config import SkyRLTrainConfig, GeneratorConfig, get_config_as_
 from skyrl.train.utils import validate_cfg
 from skyrl.train.utils.utils import initialize_ray
 from skyrl.train.utils.rate_limiter import RateLimiterConfig
-from ..harbor_generator import HarborGenerator
-from ..dataset import HarborTaskDataset
+from skyrl.integration.harbor.harbor_generator import HarborGenerator
+from skyrl.integration.harbor.dataset import HarborTaskDataset
+from skyrl.integration.harbor.masking import TIMEOUT_MASK_INSTANCE_FRACTION
 
 # NOTE (sumanthrh): We use a YAML to store the defaults for the Harbor trial configuration
 # TODO: Convert to a dataclass
@@ -35,9 +36,25 @@ def _deep_merge(base: dict, overrides: dict) -> dict:
 
 @dataclass
 class HarborGeneratorConfig(GeneratorConfig):
-    """GeneratorConfig with Harbor-specific rate limiting."""
+    """GeneratorConfig with Harbor-specific rate limiting and failure masking."""
 
     rate_limit: RateLimiterConfig = field(default_factory=RateLimiterConfig)
+    timeout_mask_instance_fraction: float = TIMEOUT_MASK_INSTANCE_FRACTION
+    """An instance is masked whole once this share of its trials timed out; below it, only those trials are.
+
+    A timed-out trial ran out of Harbor's agent time (``AgentTimeoutError``). The default, ``0.25``, masks a group of
+    8 at two timeouts and a group of 16 at four. ``0`` masks the instance on any timeout; ``1`` masks only the
+    timed-out trials. Below the fraction, the instance's other trials train; advantage estimators that compare an
+    instance's trials (``grpo``, ``rloo``, ``maxrl``) still count a masked trial as reward 0. A trial that fails any
+    other way (a sandbox that never starts, no verifier result, a crash) always masks its instance."""
+
+    def __post_init__(self) -> None:
+        super().__post_init__()
+        if not 0 <= self.timeout_mask_instance_fraction <= 1:
+            raise ValueError(
+                "generator.timeout_mask_instance_fraction must be between 0 and 1, "
+                f"got {self.timeout_mask_instance_fraction}."
+            )
 
 
 @dataclass

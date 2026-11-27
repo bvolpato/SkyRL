@@ -181,6 +181,46 @@ checkpoint-format vision-block exclusions remain BF16. The path does not silentl
 change that policy for a topology or add a VLM-specific merger fallback; a configuration
 that vLLM cannot instantiate fails at startup.
 
+### Serialized NVFP4 expert sync (`expert_nvfp4`)
+
+`trainer.policy.megatron_config.expert_nvfp4=true` trains the routed experts on vLLM's NVFP4 grid
+(`workers/megatron/quantization/expert_nvfp4.py`: a hook on TE's grouped GEMM rounds the registered routed-expert
+weights in fprop and dgrad; `expert_nvfp4_mode: w4a16`, the default, rounds only the weights, `w4a4` the per-token
+expert inputs too, with NVFP4 tensor-core fprops; `num_layers_at_{start,end}_in_bf16`, the same knobs as FP8, keep
+the first / last N layers' experts BF16 on both sides) and syncs the same expert weights to vLLM.
+`SerializedNvfp4WeightSource` (`weight_sync/nvfp4.py`) quantizes each exported BF16 expert with the trainer's own
+quantizer (`kernels/nvfp4_quant.quantize_experts`: FlashInfer `fp4_quantize` with vLLM's per-expert global scale and
+`expert_nvfp4_block_scale`, `absmax` or `four_over_six`) -- gate and up together, so they share one global scale --
+and ships ModelOpt NVFP4 checkpoint tensors (`weight` uint8, `weight_scale` e4m3, `weight_scale_2`, `input_scale`).
+vLLM boots as `modelopt_fp4` with dummy weights and a per-token MoE activation override on the FlashInfer TRT-LLM
+backend; its layerwise reload only re-lays the tensors out, so the sampler's expert weights are the bytes the
+trainer rounds to. The engines' activation quantizer reads FlashInfer's NVFP4 env, which
+`prepare_runtime_environment` derives from `expert_nvfp4_block_scale` with every key explicit
+(`kernels/nvfp4_quant.flashinfer_nvfp4_env`: 4/6 MSE on FlashInfer's fast error path, E4M3 bound 448). Run vLLM's
+experts expert-parallel: under expert TP the down_proj input's per-token scale covers only a rank's slice (`w4a4`
+rejects that layout). Serialized NVFP4 is incompatible with `fp8_weight_sync_mode` and the delta / sharded-RDT
+backends, and works with vLLM sleep level 2. It requires SM100/SM103, full-parameter training, expert TP 1,
+and per-expert HF checkpoint names (Qwen3-MoE style); fused-expert checkpoints, LoRA and MTP are unsupported.
+Cost controls (all byte-identical on the wire): `metadata()` is shape-only (the serializer runs over the wrapped
+source's metadata with `Nvfp4ExpertSpecSerializer`, so it quantizes nothing); on NCCL non-sender ranks
+`build_trainer_engine` calls `mark_replay_only`, after which iteration only drains the Megatron export (its
+gathers are collectives) and skips quantization, since vLLM's NCCL engine discards a non-sender's stream (IPC
+non-senders still serialize: each ships its own handles).
+
+`megatron_config.expert_nvfp4_stacked_sync` (default true; set false for the per-expert path) ships each NVFP4 MoE layer as 8 tensors stacked
+over all experts, already in vLLM's ModelOpt-NVFP4 `FusedMoE` parameter layout (`weight_sync/nvfp4_stacked.py`,
+names `__skyrl_nvfp4_stacked__:<layer>.<w13|w2>_<weight|weight_scale|weight_scale_2|input_scale>`), instead of
+8 tensors per expert (~74k for Qwen3-30B-A3B). Quantization is the same per-expert call written into a
+preallocated stack, so the bytes are the per-expert stream's bytes. On vLLM, `SkyrlCheckpointLoadMixin` routes
+them to `nvfp4_stacked_receive.Nvfp4StackedReceiver`, which collects a layer and then runs vLLM's
+`_layerwise_process` steps itself (`process_layer_with_direct_copy`) with one `copy_` per parameter (the local
+experts' rows under EP) in place of the per-expert loader replay, so the TRT-LLM re-layout runs once per layer
+through vLLM's own `process_weights_after_loading`. `fast_path_plan` checks every precondition (ModelOpt NVFP4,
+MoE TP 1, no padded shards / redundant / fused-shared experts, exact parameter shapes, no other loadable
+tensors); otherwise the layer is unstacked and loaded per expert as before. The source declares the largest
+stacked tensor as a packed-buffer floor (`skyrl_min_packed_buffer_bytes`). `SKYRL_NVFP4_SYNC_TIMING=1` logs
+sender produce time and receiver layer-load time (logging only).
+
 ### Control plane
 
 `control_plane.SkyrlWeightSyncClient` is a **blocking** HTTP client over vLLM's native
@@ -591,10 +631,28 @@ Non-colocated normally keeps the engine fully awake and does `pause_generation �
 
 The fully-async path is driven entirely from SkyRL — no vLLM patch. It deliberately avoids the `/sleep`+`/wake_up` HTTP endpoints (which route through `EngineCore.sleep`, force-clearing the prefix cache and preempting every running request at level ≥ 1). Instead it drives the per-worker `CuMemAllocator` directly via two `NewInferenceWorkerWrap` methods invoked over `/collective_rpc`:
 
-- `skyrl_sleep_for_weight_sync(offload_kv)` — `allocator.sleep(offload_tags=("runtime", "cudagraph", "kv_cache") if offload_kv else ("runtime", "cudagraph"))`: **discards** the weights pool (the broadcast overwrites every parameter on wake) and either offloads the KV cache to CPU or discards it. The `runtime` (KV-init state) and `cudagraph` pools, new in vLLM 0.32.0, are always offloaded like upstream `CuMemBackend.suspend` does: any wake remaps them, so discarding them crashes the next forward with an illegal memory access. Model buffers live in the weights pool and are NOT covered by the parameter broadcast (e.g. non-persistent rotary `inv_freq`), so they are saved to CPU here and restored on wake — mirroring `GPUWorker.sleep(level=2)`. All GPU memory is freed regardless. The scheduler is untouched, so KEEP-paused requests stay frozen with valid block tables.
+- `skyrl_sleep_for_weight_sync(offload_kv, offload_weights=False)` — `allocator.sleep(offload_tags=("runtime", "cudagraph", "kv_cache") if offload_kv else ("runtime", "cudagraph"))`, plus `"weights"` when `offload_weights`: by default **discards** the weights pool (the broadcast overwrites every parameter on wake) and either offloads the KV cache to CPU or discards it. `offload_weights=True` offloads the weights pool to CPU instead; the colocated frozen path (below) sets it for a LoRA adapter sync, which does not send the base model again. The client always sends `offload_weights` explicitly. The `runtime` (KV-init state) and `cudagraph` pools, new in vLLM 0.32.0, are always offloaded like upstream `CuMemBackend.suspend` does: any wake remaps them, so discarding them crashes the next forward with an illegal memory access. Model buffers live in the weights pool and are NOT covered by the parameter broadcast (e.g. non-persistent rotary `inv_freq`), so they are saved to CPU here and restored on wake — mirroring `GPUWorker.sleep(level=2)`. All GPU memory is freed regardless. The scheduler is untouched, so KEEP-paused requests stay frozen with valid block tables.
 - `skyrl_wake_for_weight_sync(tags)` — `torch.cuda.empty_cache()` (release the broadcast's transient buffers so cumem can remap the KV pool) then `allocator.wake_up(tags)`, which remaps to the **same virtual addresses** and copies CPU→GPU so block tables remain valid. On the `weights` wake it restores the saved buffers; on the `kv_cache` wake it re-inits fp8 KV scales. Does not resume the scheduler (the client does that via `/resume`).
 
 Validated in `validate_inference_engine_cfg`. vLLM-version coupled (mirrors `GPUWorker.sleep`/`wake_up` and the `CuMemAllocator` API) — re-verify on vLLM bumps via the GPU weight-sync test.
+
+## Frozen-request sync for colocated partial rollout
+
+`PartialRolloutRayPPOTrainer` (`skyrl/train/partial_rollout_trainer.py`, `colocate_all=true`) reuses the same KEEP pause and allocator methods as the fully-async path above, so that in-flight requests stay paused through training on the shared GPUs and resume under the new weights. It is the same pause/resume, held longer: the engines must free the GPUs for training without aborting the in-flight requests:
+
+1. **Pause** — the trainer's `_before_training_step` calls `RemoteInferenceClient.sleep_with_frozen_requests(offload_kv)`: `pause_generation()` (KEEP) then `sleep_for_weight_sync(offload_kv, offload_weights=uses_lora_weight_sync)`. It sets `requests_frozen_asleep=True` and records `frozen_kv_offloaded=offload_kv`. The trainer passes `offload_kv = not clear_kv_cache_on_weight_sync`.
+2. **Train** — the trainer model trains on the freed GPUs, and the step's checkpoint (if any) is written while the engines still sleep (`_checkpoint_before_weight_sync` returns True).
+3. **Sync** — `save_weights_for_sampler` first runs `_prepare_for_weight_sync`, which does **not** call `sleep()` while `_engines_hold_frozen_requests()` is true: `sleep()` goes through `/sleep`, which aborts the paused requests. It then takes its frozen branch: `_assert_frozen_requests_have_a_kv_cache_source()` → `wake_for_weight_sync(["weights"])` → broadcast → `wake_for_weight_sync(["kv_cache"])` → `resume_generation()`. `resume()` clears `requests_frozen_asleep`.
+
+KV cache of the paused requests:
+
+- `offload_kv=True` (`clear_kv_cache_on_weight_sync=false`): the KV pool goes to host memory during training and comes back at the same virtual addresses. Requests resume with no prefill, on KV computed by the older weights. The host needs memory for the KV pools of all engines.
+- `offload_kv=False` (`clear_kv_cache_on_weight_sync=true`): the KV pool is discarded. The paused requests are then correct only because the broadcast resets the prefix cache with `reset_running_requests=True` (`Worker._reset_prefix_cache_task`), which moves them back to waiting so the engine prefills them with the new weights. `_assert_frozen_requests_have_a_kv_cache_source` rejects a sync that would discard KV without that reset, using the condition of `Worker._should_reset_prefix_cache` (prefix caching on, and under fully-async `clear_kv_cache_on_weight_sync`). The trainer also requires `enable_prefix_caching` at init.
+- The reset runs inside the broadcast, while the KV pool is still asleep. That is safe because vLLM's `Scheduler.reset_prefix_cache` only changes scheduler and block-pool metadata (it frees block IDs and clears the block-hash maps) and never touches KV tensors. Re-verify on vLLM bumps with the GPU test `test_frozen_sleep_that_discards_kv_survives_the_prefix_cache_reset`.
+
+Failure handling: if the broadcast fails, the frozen branch leaves the engines asleep and the requests paused, and the error propagates. It does not wake the KV cache or resume onto a half-synced model while the trainer still holds the GPUs; the run ends on that error.
+
+`_engines_hold_frozen_requests()` reads `requests_frozen_asleep` with `is True`, and `_assert_frozen_requests_have_a_kv_cache_source()` reads `frozen_kv_offloaded` with `is not False`, on purpose: other client classes lack these attributes, and the dispatch tests' mock clients have truthy attributes that would otherwise take the frozen branch.
 
 ## Convention: vLLM imports
 
@@ -661,6 +719,7 @@ The CPU tests do **not** import `NewInferenceWorkerWrap`. Any change to the work
 | `LocalCheckpointStore` (fetch, replay, apply, cache keys) | `test_delta_checkpoint.py` |
 | `DeltaWeightTransferEngine` (receive side) | GPU `test_delta_weight_sync_e2e.py` only — it runs inside the vLLM worker |
 | Who pauses / resets the prefix cache | `test_prefix_cache_reset.py` **and** `distributed/test_worker_dispatch.py` |
+| Frozen-request colocated sync (`sleep_with_frozen_requests`, the frozen branch of `save_weights_for_sampler`, `_prepare_for_weight_sync`) | `inference_servers/test_remote_inference_client_frozen_sleep.py` + `distributed/test_worker_dispatch.py` (CPU) **and** GPU `gpu_ci/test_offload_kv_weight_sync.py` |
 | `DeltaWeightSyncConfig` defaults or validation | `tests/train/test_config.py` |
 | Serialized FP8 (`fp8/` specs, exclusions, wire formats) | `tests/backends/skyrl_train/weight_sync/fp8/` (CPU; `test_fp8_exclusions_vllm.py` runs SkyRL's exclude list through vLLM's matching and needs the vllm extra) **and** GPU `megatron/test_megatron_models.py -m b200 -k mxfp8` (or `-m h100 -k full_fp8` on Hopper) |
 

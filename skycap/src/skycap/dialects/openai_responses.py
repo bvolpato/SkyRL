@@ -12,11 +12,21 @@ else starts one. Items with a role are turns of that role, and ``instructions``
 is a leading ``system`` turn. (Note that later on in the renderer, ``developer``
 role items may be converted to ``system`` role items.)
 
+A ``custom`` tool, whose input is one raw string, is shown to the model with
+vLLM's shim (``custom_tool_as_function_dict``): a function of one string
+parameter, ``input``. A grammar on it is appended to the description as text and
+is not enforced while sampling. vLLM v0.33.0 refuses custom tools with a grammar,
+so a prompt with one has no vLLM counterpart. A ``custom_tool_call`` regroups
+like a ``function_call``, as the call of that function with its input under
+``input`` (spelled compactly, as ``renderer.parse`` spells arguments, where vLLM
+uses ``json.dumps``'s default separators), and a ``custom_tool_call_output`` is
+a ``tool`` turn.
+
 skycap is stricter than vLLM where vLLM would drop part of the input and so
-change what the model sees: a non-function tool, a second content part in a
-reasoning item or assistant message, a trailing partial assistant item (vLLM
-continues it), and server-held state (``previous_response_id``). Those are
-refused, never dropped. Fields whose chat counterpart the chat dialect ignores
+change what the model sees: a tool that is neither a function nor a custom
+tool, a second content part in a reasoning item or assistant message, a
+trailing partial assistant item (vLLM continues it), and server-held state
+(``previous_response_id``). Those are refused, never dropped. Fields whose chat counterpart the chat dialect ignores
 (``tool_choice``, ``parallel_tool_calls``, ``text``, ``reasoning``, ``include``)
 are ignored here too, and forwarded in text mode.
 
@@ -24,7 +34,8 @@ Reasoning goes in the turn's ``reasoning_content``, the name skycap's renderers
 parse it into (vLLM's own turns call it ``reasoning``).
 
 **Reply.** One turn becomes up to N items, in the order a chat template renders
-them: ``reasoning``, ``message``, then one ``function_call`` per call. Ids derive
+them: ``reasoning``, ``message``, then one ``function_call`` per call, or a
+``custom_tool_call`` for a call to a custom tool's function. Ids derive
 from the sampled tokens, so a replayed reply is byte-identical. The stream is
 built from the finished reply.
 
@@ -38,6 +49,7 @@ that turn's hash, so the replay finds it whatever the round trip loses.
 from __future__ import annotations
 
 import itertools
+import json
 import secrets
 import time
 from collections.abc import Iterator, Sequence
@@ -66,9 +78,11 @@ INPUT_TEXT_PARTS = ("input_text", "text", "output_text")
 #: Statuses of an item vLLM would continue rather than answer after.
 PARTIAL_STATUSES = ("in_progress", "incomplete")
 #: Output item types a reply's turn is rebuilt from.
-TURN_ITEM_TYPES = ("reasoning", "message", "function_call")
+TURN_ITEM_TYPES = ("reasoning", "message", "function_call", "custom_tool_call")
 #: Response events that end a streamed reply.
 TERMINAL_EVENTS = ("response.completed", "response.incomplete", "response.failed")
+#: The one parameter of the function a custom tool is shown as, named as vLLM names it (``CUSTOM_TOOL_INPUT_KEY``).
+CUSTOM_INPUT = "input"
 
 
 class ResponsesDialect(Dialect):
@@ -77,8 +91,8 @@ class ResponsesDialect(Dialect):
     # `use_raw_content` is for chat harnesses that parse the reply text themselves and replay only `content`
     # (Terminus-2): the whole turn, reasoning included, then comes back unchanged. A Responses client acts only on
     # structured items, so raw text with inline tool calls would never run one, and it replays reasoning as its
-    # own item, so parsed replies already come back unchanged. A call on a raw-content server is refused (400)
-    # rather than answered against the server's setting; the chat route still serves such harnesses.
+    # own item, so parsed replies already come back unchanged. A raw-content server answers this route with parsed
+    # replies, so one server can serve both kinds of harness.
     raw_content = False
 
     def parse_request(self, body: Any) -> CallRequest:
@@ -166,7 +180,7 @@ class ResponsesDialect(Dialect):
             "created_at": int(time.time()),
             "status": "incomplete" if cut_off else "completed",
             "model": turn.model,
-            "output": output_items(turn),
+            "output": output_items(turn, _custom_names(call)),
             "usage": {
                 "input_tokens": turn.prompt_tokens,
                 "input_tokens_details": {"cached_tokens": 0},
@@ -208,11 +222,15 @@ class ResponsesDialect(Dialect):
                 yield events(
                     "response.function_call_arguments.done", **at, name=item["name"], arguments=item["arguments"]
                 )
+            elif item["type"] == "custom_tool_call":
+                if item["input"]:
+                    yield events("response.custom_tool_call_input.delta", **at, delta=item["input"])
+                yield events("response.custom_tool_call_input.done", **at, input=item["input"])
             yield events("response.output_item.done", output_index=index, item=item)
         yield events(f"response.{reply['status']}", response=reply)
 
-    def replayed(self, turn: Turn) -> dict[str, Any]:
-        turns = items_to_turns(output_items(turn), "output")
+    def replayed(self, call: CallRequest, turn: Turn) -> dict[str, Any]:
+        turns = items_to_turns(output_items(turn, _custom_names(call)), "output")
         if len(turns) != 1 or turns[0].get("role") != "assistant":
             raise ValueError(f"a reply's items regrouped into {len(turns)} turns, not one assistant turn")
         return turns[0]
@@ -309,8 +327,8 @@ def _from_item(item: dict[str, Any], previous: dict[str, Any] | None, where: str
     """A new turn for ``item``, or None when it went into ``previous``, the last turn so far."""
     assistant = previous if previous is not None and previous.get("role") == "assistant" else None
     kind = item.get("type")
-    if kind == "function_call":
-        call = _function_call(item, where)
+    if kind in ("function_call", "custom_tool_call"):
+        call = _tool_call(item, where)
         if assistant is not None:
             assistant.setdefault("tool_calls", []).append(call)
             return None
@@ -321,7 +339,7 @@ def _from_item(item: dict[str, Any], previous: dict[str, Any] | None, where: str
             assistant["reasoning_content"] = reasoning
             return None
         return {"role": "assistant", "reasoning_content": reasoning}
-    if kind == "function_call_output":
+    if kind in ("function_call_output", "custom_tool_call_output"):
         call_id = item.get("call_id")
         if not isinstance(call_id, str):
             raise RequestError(f"`{where}.call_id` must be a string")
@@ -341,17 +359,23 @@ def _from_item(item: dict[str, Any], previous: dict[str, Any] | None, where: str
     raise RequestError(f"Unsupported input item type: {kind}")
 
 
-def _function_call(item: dict[str, Any], where: str) -> dict[str, Any]:
+def _tool_call(item: dict[str, Any], where: str) -> dict[str, Any]:
+    """A ``function_call`` or ``custom_tool_call`` as a chat tool call. A custom call is the call of the function
+    its tool is shown as: its ``input`` under the one parameter (``_custom_arguments``)."""
     if item.get("namespace"):
-        raise RequestError(f"`{where}`: namespaced tool calls are not supported; send function tools only")
-    for name in ("call_id", "name", "arguments"):
+        raise RequestError(f"`{where}`: namespaced tool calls are not supported; send tools without a namespace")
+    payload = "input" if item["type"] == "custom_tool_call" else "arguments"
+    for name in ("call_id", "name", payload):
         if not isinstance(item.get(name), str):
             raise RequestError(f"`{where}.{name}` must be a string")
-    return {
-        "id": item["call_id"],
-        "type": "function",
-        "function": {"name": item["name"], "arguments": item["arguments"]},
-    }
+    arguments = _custom_arguments(item["input"]) if payload == "input" else item["arguments"]
+    return {"id": item["call_id"], "type": "function", "function": {"name": item["name"], "arguments": arguments}}
+
+
+def _custom_arguments(text: str) -> str:
+    """The arguments of a call to a custom tool's function, for its ``input``. vLLM's encoding
+    (``encode_custom_tool_input``) in ``renderer.parse``'s spelling of arguments."""
+    return json.dumps({CUSTOM_INPUT: text}, separators=(",", ":"), ensure_ascii=False)
 
 
 def _reasoning(item: dict[str, Any], where: str) -> str:
@@ -424,7 +448,8 @@ def _refuse_trailing_partial(items: list[Any]) -> None:
 
 
 def _tools(tools: Any) -> list[dict[str, Any]] | None:
-    """Function tools in the chat spelling: every field but ``type`` under ``function``, as vLLM does."""
+    """Tools in the chat spelling, as vLLM converts them: a function's fields but ``type`` under ``function``,
+    and a custom tool as a function of one string (``_custom_function``)."""
     if tools is None or tools == []:
         return None
     if not isinstance(tools, list):
@@ -432,19 +457,61 @@ def _tools(tools: Any) -> list[dict[str, Any]] | None:
     converted = []
     for index, tool in enumerate(tools):
         kind = tool.get("type") if isinstance(tool, dict) else None
-        if kind != "function":
-            raise RequestError(f"tool type {kind!r} (`tools[{index}]`) is not supported: skycap serves function tools")
+        if kind not in ("function", "custom"):
+            raise RequestError(
+                f"tool type {kind!r} (`tools[{index}]`) is not supported: skycap serves function and custom tools"
+            )
         if not isinstance(tool.get("name"), str):
             raise RequestError(f"`tools[{index}].name` must be a string")
-        function = {key: value for key, value in tool.items() if key != "type" and value is not None}
+        # Chat templates render only function tools, and a model emits calls only in its own tool-call format, so a
+        # custom tool is shown as a function. Its calls are mapped back to custom items in the reply.
+        if kind == "custom":
+            function = _custom_function(tool, f"tools[{index}]")
+        else:
+            function = {key: value for key, value in tool.items() if key != "type" and value is not None}
         converted.append({"type": "function", "function": function})
+    names = [tool["function"]["name"] for tool in converted]
+    for tool in tools:
+        if tool["type"] == "custom" and names.count(tool["name"]) > 1:
+            raise RequestError(f"two tools are named {tool['name']!r}: a custom tool's name must be unique")
     return converted
 
 
-def output_items(turn: Turn) -> list[dict[str, Any]]:
+def _custom_function(tool: dict[str, Any], where: str) -> dict[str, Any]:
+    """A custom tool as vLLM v0.33.0's ``custom_tool_as_function_dict`` shows it: a function of one string,
+    ``input``, with the tool's description, null when it has none. A grammar, which vLLM refuses, is appended
+    to the description."""
+    description = tool.get("description")
+    if description is not None and not isinstance(description, str):
+        raise RequestError(f"`{where}.description` must be a string")
+    form = tool.get("format") or {"type": "text"}
+    if not isinstance(form, dict):
+        raise RequestError(f'`{where}.format` must be an object, such as {{"type": "text"}}')
+    kind = form.get("type")
+    # The grammar goes into the description as text; sampling does not enforce it.
+    if kind == "grammar":
+        syntax, definition = form.get("syntax"), form.get("definition")
+        if not isinstance(syntax, str) or not isinstance(definition, str):
+            raise RequestError(f"`{where}.format` must give the grammar's `syntax` and `definition` as strings")
+        grammar = f"The input follows this {syntax} grammar:\n{definition}"
+        description = f"{description}\n\n{grammar}" if description else grammar
+    elif kind != "text":
+        raise RequestError(f"`{where}.format` of type {kind!r} is not supported: send `text` or `grammar`")
+    function: dict[str, Any] = {"name": tool["name"], "description": description}
+    function["parameters"] = {
+        "type": "object",
+        "properties": {CUSTOM_INPUT: {"type": "string", "description": "The freeform text payload for this tool."}},
+        "required": [CUSTOM_INPUT],
+        "additionalProperties": False,
+    }
+    return function
+
+
+def output_items(turn: Turn, custom: frozenset[str] = frozenset()) -> list[dict[str, Any]]:
     """A sampled turn as output items: reasoning, message, then one per call. Ids derive from ``turn.key``.
 
-    A turn with nothing at all still gets one empty message, so the client's history holds the turn.
+    A call to one of ``custom``, the request's custom tools, is a ``custom_tool_call`` (``_custom_input``). A turn
+    with nothing at all still gets one empty message, so the client's history holds the turn.
     """
     message = turn.message
     items: list[dict[str, Any]] = []
@@ -473,17 +540,46 @@ def output_items(turn: Turn) -> list[dict[str, Any]]:
         )
     for index, call in enumerate(calls):
         function = call.get("function") or {}
+        name, arguments = function.get("name"), function.get("arguments") or ""
+        if name in custom:
+            items.append(
+                {
+                    "type": "custom_tool_call",
+                    "id": f"ctc_{turn.key}_{index}",
+                    "call_id": call.get("id"),
+                    "name": name,
+                    "input": _custom_input(arguments),
+                }
+            )
+            continue
         items.append(
             {
                 "type": "function_call",
                 "id": f"fc_{turn.key}_{index}",
                 "call_id": call.get("id"),
-                "name": function.get("name"),
-                "arguments": function.get("arguments") or "",
+                "name": name,
+                "arguments": arguments,
                 "status": "completed",
             }
         )
     return items
+
+
+def _custom_names(call: CallRequest) -> frozenset[str]:
+    """The names of the request's custom tools, read from the body ``parse_request`` checked."""
+    return frozenset(tool["name"] for tool in call.body.get("tools") or () if tool.get("type") == "custom")
+
+
+def _custom_input(arguments: str) -> str:
+    """The ``input`` of a sampled call to a custom tool's function, as vLLM decodes it
+    (``decode_custom_tool_input``): the string under ``input``, else the arguments as they are, malformed
+    or not."""
+    try:
+        parsed = json.loads(arguments)
+    except ValueError:
+        return arguments
+    payload = parsed.get(CUSTOM_INPUT) if isinstance(parsed, dict) else None
+    return payload if isinstance(payload, str) else arguments
 
 
 def _opened(item: dict[str, Any]) -> dict[str, Any]:
@@ -494,6 +590,8 @@ def _opened(item: dict[str, Any]) -> dict[str, Any]:
         return {**item, "content": []}
     if item["type"] == "function_call":
         return {**item, "status": "in_progress", "arguments": ""}
+    if item["type"] == "custom_tool_call":
+        return {**item, "input": ""}
     return item
 
 

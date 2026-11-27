@@ -7,6 +7,7 @@ import sys
 from skyrl.train.config import SkyRLTrainConfig
 from skyrl.train.entrypoints.main_base import BasePPOExp, validate_cfg
 from skyrl.train.fully_async_trainer import FullyAsyncRayPPOTrainer
+from skyrl.train.partial_rollout_trainer import PartialRolloutRayPPOTrainer
 import asyncio
 from skyrl.train.utils import initialize_ray
 import ray
@@ -24,7 +25,11 @@ class FullyAsyncPPOExp(BasePPOExp):
         generator,
         colocate_pg,
     ):
-        return FullyAsyncRayPPOTrainer(
+        # With colocated inference engines, generation cannot overlap training. The partial-rollout
+        # trainer keeps the in-flight requests paused through training and resumes them after the
+        # weight sync, the same pause and resume that fully-async training does at each weight sync.
+        trainer_cls = PartialRolloutRayPPOTrainer if cfg.trainer.placement.colocate_all else FullyAsyncRayPPOTrainer
+        return trainer_cls(
             cfg=cfg,
             tracker=tracker,
             tokenizer=tokenizer,

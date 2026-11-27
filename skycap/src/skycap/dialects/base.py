@@ -100,7 +100,7 @@ class Turn:
     completion_tokens: int
     #: A digest of the prompt length and the sampled ids, for ids a client sends back.
     key: str
-    #: The server's ``use_raw_content``.
+    #: Whether the reply was the completion's raw text: the server's ``use_raw_content``, on an API that carries it.
     raw_content: bool = False
 
 
@@ -203,8 +203,8 @@ class Dialect(ABC):
     def stream(self, reply: dict[str, Any]) -> Iterator[bytes]:
         """``reply`` as SSE frames. Built from the finished reply, so a retry can replay the same bytes."""
 
-    def replayed(self, turn: Turn) -> dict[str, Any]:
-        """The turn as ``parse_request`` rebuilds it when the client sends the reply back.
+    def replayed(self, call: CallRequest, turn: Turn) -> dict[str, Any]:
+        """The turn as ``parse_request`` rebuilds it when the client sends the reply to ``call`` back.
 
         The model node is stored under this turn's match hash, so the client's replay finds it even
         where the reply's wire form doesn't map back to exactly the parsed message.

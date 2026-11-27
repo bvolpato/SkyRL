@@ -103,21 +103,29 @@ def parallel_state(monkeypatch):
     return mpu
 
 
+class _Router:
+    """A trunk router's ``RouterReplay`` instance."""
+
+    is_mtp_layer = False
+
+    def set_target_indices(self, indices):
+        self.target_topk_idx = indices
+
+
 @pytest.fixture
 def router_replay(monkeypatch):
     """Capture what ``setup_per_microbatch_replay_forward`` hands Megatron."""
     module = types.ModuleType("megatron.core.transformer.moe.router_replay")
 
     class RouterReplay:
-        global_router_replay_instances = [object() for _ in range(NUM_LAYERS)]
-        replay_data: list[torch.Tensor] | None = None
+        global_router_replay_instances = [_Router() for _ in range(NUM_LAYERS)]
 
         @classmethod
-        def set_replay_data(cls, replay_data):
-            cls.replay_data = replay_data
+        def get_instances(cls, is_mtp_layer=None):
+            return cls.global_router_replay_instances
 
         @classmethod
-        def set_global_router_replay_action(cls, action):
+        def set_global_router_replay_action(cls, action, *, is_mtp_layer=None):
             pass
 
     module.RouterReplay = RouterReplay
@@ -220,7 +228,7 @@ def _run_both_paths(
     tp_rank = tp_size - 1
     monkeypatch.setattr(parallel_state, "get_tensor_model_parallel_world_size", lambda: tp_size, raising=False)
     monkeypatch.setattr(parallel_state, "get_tensor_model_parallel_rank", lambda: tp_rank, raising=False)
-    router_replay.global_router_replay_instances = [object() for _ in local_layers]
+    router_replay.global_router_replay_instances = [_Router() for _ in local_layers]
     monkeypatch.setattr(replay_utils, "_get_current_pp_stage_layer_range", lambda model_config: stage_range)
 
     layout = build_token_metadata_layout(attention_mask, packed_routes.device, packed=packed, fp8_enabled=False)
@@ -233,7 +241,7 @@ def _run_both_paths(
         metadata_layout=layout,
         remove_microbatch_padding=packed,
     )
-    new_replay_data = [tensor.clone() for tensor in router_replay.replay_data]
+    new_replay_data = [router.target_topk_idx.clone() for router in router_replay.global_router_replay_instances]
 
     reference = _reference_replay_data(
         padded_routes,

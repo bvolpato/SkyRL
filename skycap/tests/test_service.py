@@ -55,6 +55,7 @@ async def test_token_mode_is_built_from_options(tmp_path: Path) -> None:
         await engine.close()
     assert result.status == "finished" and len(result.samples) == 1
     assert service.server.backend.describe()["use_raw_content"] is True
+    assert service.server.backend.describe()["raw_content_dialects"] == ["openai_chat"]
 
 
 def test_bad_options_are_refused_before_anything_starts() -> None:

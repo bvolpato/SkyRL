@@ -80,13 +80,13 @@ result = search_tools.execute_tool("search", "Context to search")
 
 ## Environment Integration
 
-Tools groups can be integrated into any environment in SkyGym-RL. The base environment class for text-based environments is `BaseTextEnv`, which provides simple utilities for managing and using multiple tool groups in a single envrionment.
+Tools groups can be integrated into any environment in SkyGym-RL. The base environment class for text-based environments is `BaseTextEnv`, which provides simple utilities for managing and using multiple tool groups in a single environment.
 
 The following sub-sections walk through integrating and using tools in an environment.
 
 ### Tool Initialization
 
-To incorporate tools into an envrionment, first build and initialize the tool groups during environment construction:
+To incorporate tools into an environment, first build and initialize the tool groups during environment construction:
 
 ```python
 from skygym.envs.base_text_env import BaseTextEnv
@@ -106,7 +106,7 @@ class MyEnvironment(BaseTextEnv):
 
 ### Tool Execution
 
-To use a tool and get the result, you can call the `_execute_tool` (provided by `BaseTextEnv`) method with the tool group name, tool name, and the tool input. Tools are most often used in the envrionment `step` method.
+To use a tool and get the result, you can call the `_execute_tool` (provided by `BaseTextEnv`) method with the tool group name, tool name, and the tool input. Tools are most often used in the environment `step` method.
 
 ```python
 def step(self, action: str):
