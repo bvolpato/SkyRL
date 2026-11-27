@@ -57,7 +57,7 @@ Prefill-Decode disaggregation:
 ## Key Config Knobs
 
 All under `generator.inference_engine.*`:
-- `enforce_eager` (bool, default true): With `enforce_eager=false`, there can be more mismatch between inference logprobs and trainer logprobs. It is recommended to use off policy correction methods like Truncated Importance Sampling (see `docs/content/docs/algorithms/off_policy_correction.mdx` for details) to prevent logprobs drift. 
+- `enforce_eager` (bool, default false): The default `enforce_eager=false` enables CUDA graphs and torch.compile in vLLM, which can increase the mismatch between inference logprobs and trainer logprobs. It is recommended to use off policy correction methods like Truncated Importance Sampling (see `docs/content/docs/algorithms/off_policy_correction.mdx` for details) to prevent logprobs drift. Set `enforce_eager=true` to run vLLM in eager mode.
 - `gpu_memory_utilization` (float, default 0.8)
 - `max_num_batched_tokens` (int, default 8192)
 - `max_num_seqs` (int, default 1024)

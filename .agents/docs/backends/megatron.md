@@ -7,7 +7,7 @@ SkyRL uses Megatron-Bridge for HF-to-Megatron model conversion. Installed from g
 ## Key abstractions
 - `MegatronConfig` in `skyrl/train/config.py`
 - `MegatronWorker` in `skyrl/backends/skyrl_train/workers/megatron/megatron_worker.py`.
-- Custom bridges in `skyrl/backends/skyrl_train/workers/megatron/model_bridges.py` (e.g., `GLM47FlashBridge`).
+- Custom bridges in `skyrl/backends/skyrl_train/workers/megatron/model_bridges.py` (e.g., `KimiK25TextBridge`).
 - GLM-5.3-Flash (`glm5_next`): `skyrl/backends/skyrl_train/patches/megatron/glm5_next/` (provider, block
   spec, bridge; Megatron-Bridge-shaped) on top of `skyrl/backends/skyrl_train/patches/megatron/mcore_ext/`
   (Megatron-Core-shaped: `hyper_connection.py` backport of Megatron-LM main's mHC module,
@@ -52,6 +52,26 @@ Note: Sequence parallelism is auto-enabled when `tensor_model_parallel_size > 1`
 ## Test Requirements
 
 Megatron GPU tests need: `NVTE_FLASH_ATTN=0`
+
+## NVFP4 quantization-aware training (`workers/megatron/quantization/`)
+
+- `expert_nvfp4.py` (`megatron_config.expert_nvfp4`): rounds the routed-expert weights, and with `w4a4` the
+  per-token expert inputs, to the rollouts' NVFP4 grid. The weight sync side is in `weight_sync.md`
+  ("Serialized NVFP4 expert sync"). The round trips and packs run on the fused sm_100 kernels
+  (`kernels/nvfp4_quant/fused_rt.py`, `csrc/nvfp4_roundtrip.cu`), which `nvcc` builds on first use into
+  `SKYRL_QAT_NVFP4_KERNEL_DIR` (default `$TMPDIR/skyrl_nvfp4_kernels_<uid>`; the user's own, not writable by
+  others). Without `nvcc`, after a failed build, or with `SKYRL_QAT_NVFP4_FUSED=0`, they run on FlashInfer and
+  the Triton decode (`kernels/nvfp4_quant/decode.py`) with the same round-to-nearest bytes
+  (`tests/backends/skyrl_train/gpu/gpu_ci/test_nvfp4_fused_roundtrip.py`). The startup line
+  `expert_nvfp4 (<mode>): ...` names the path in use.
+- `fake_kv_cache_qat.py` (`megatron_config.kv_cache_qat`, DSA models only): replaces each absorbed-MLA key with
+  the dequantized row of vLLM's `nvfp4_ds_mla` / `fp8_ds_mla` KV cache (`kernels/kv_cache_round_trip.py`, Triton).
+  `_apply_kv_cache_qat_cfg` (`skyrl/train/utils/utils.py`) copies the format from the engines' `kv_cache_dtype`,
+  requires `attention_config.sparse_mla_force_mqa=true` and rejects `enable_pd`. Tests:
+  `tests/backends/skyrl_train/workers/megatron/quantization/test_fake_kv_cache_qat.py` (CPU) and
+  `tests/backends/skyrl_train/gpu/gpu_ci/test_kv_cache_round_trip.py` (GPU, bit-exact against vLLM's cache writer
+  and reader).
+- User docs for both: `docs/content/docs/examples/quantized_rollouts.mdx`.
 
 ## LoRA adapter import (`lora.init_adapter_path`)
 

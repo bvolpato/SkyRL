@@ -23,7 +23,7 @@ import orjson
 from aiohttp import web
 
 from skycap import hashing, retry
-from skycap.dialects.base import CallRequest, Dialect, Turn, error_body
+from skycap.dialects.base import CallRequest, Dialect, DialectType, Turn, error_body
 from skycap.graph import CallInfo
 from skycap.tokens import turn
 from skycap.tokens.developer import fold_developer
@@ -59,7 +59,9 @@ class TokensBackend:
         ``use_raw_content`` answers with the completion's own text as ``content``, as vLLM does with no
         reasoning or tool-call parser: a thinking model's reasoning stays inline, and tool calls
         stay text. For a harness written against such a server, which replays ``content`` and
-        drops ``reasoning_content``; with parsed replies it would edit every turn it replays.
+        drops ``reasoning_content``; with parsed replies it would edit every turn it replays. It
+        applies on the APIs whose replies can carry raw text (``Dialect.raw_content``); the others,
+        Responses, are answered with parsed replies, which their clients replay unchanged.
         """
         self.engine_url = engine_url.rstrip("/")
         self.renderer = renderer
@@ -89,6 +91,9 @@ class TokensBackend:
             "logprobs_mode": self.logprobs_mode,
             "sampling_overrides": self.sampling_overrides,
             "use_raw_content": self.use_raw_content,
+            "raw_content_dialects": [
+                dialect.value for dialect in DialectType if self.use_raw_content and dialect.get_dialect().raw_content
+            ],
         }
 
     async def start(self) -> None:
@@ -251,8 +256,7 @@ class TokensBackend:
         self, trajectory: Trajectory, request: web.Request, chat: CallRequest, dialect: Dialect
     ) -> web.StreamResponse:
         started = time.time()
-        if self.use_raw_content and not dialect.raw_content:
-            return dialect.error(chat, "this server answers with raw content, which this API can't carry", 400)
+        raw_content = self.use_raw_content and dialect.raw_content
         refused = dialect.unsupported_in_token_mode(chat)
         if refused is not None:
             return dialect.error(chat, refused, 400)
@@ -337,7 +341,7 @@ class TokensBackend:
             self._fail(trajectory, None, f"engine: {error}")
             return dialect.error(chat, f"engine: {error}", 502, kind="api_error")
 
-        if self.use_raw_content:
+        if raw_content:
             reply = await asyncio.to_thread(self._raw_reply, output.completion_ids, planned.prompt_ids)
         else:
             reply = await asyncio.to_thread(
@@ -351,11 +355,11 @@ class TokensBackend:
             prompt_tokens=len(planned.prompt_ids),
             completion_tokens=len(output.completion_ids),
             key=hashing.digest([len(planned.prompt_ids), output.completion_ids]),
-            raw_content=self.use_raw_content,
+            raw_content=raw_content,
         )
         # The reply as the client's replay of it will be read back, which is what the next call
         # matches: stored as the node's message and hashed for its match hash.
-        replay = dialect.replayed(sampled)
+        replay = dialect.replayed(chat, sampled)
         call = CallInfo(
             t_start=started,
             t_end=time.time(),
@@ -366,6 +370,7 @@ class TokensBackend:
             tools=tools_key or None,
             bridged=planned.bridged if follows_a_call else None,
             dialect=chat.dialect.value,
+            raw_content=raw_content,
         )
         status = "ok"
         recorded = False
